@@ -1,0 +1,25 @@
+services:
+  steam:
+    build: .
+    image: local/sts2-steam-bridge-desktop
+    container_name: sts2-steam-bridge
+    init: true
+    # Steam remains uid 1000 with no effective capabilities. The added bounding capability
+    # enables namespace syscalls in Docker's default seccomp profile; AppArmor grants userns.
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=sts2-steam-bridge
+      - seccomp=${STEAM_BRIDGE_SECCOMP:?Generate the Steam seccomp profile first}
+    shm_size: 1gb
+    environment:
+      STEAM_BRIDGE_TOKEN_FILE: /home/steam/bridge-token
+      STEAM_BRIDGE_TRANSPORT: ${STEAM_BRIDGE_TRANSPORT:-disabled}
+      STEAM_BRIDGE_STEAM_ID: ${STEAM_BRIDGE_STEAM_ID:-}
+    ports:
+      - "${STEAM_BRIDGE_DESKTOP_BIND:-127.0.0.1}:6091:6080"
+      - "127.0.0.1:6092:6092"
+    volumes:
+      - ${STEAM_BRIDGE_HOME:?Set STEAM_BRIDGE_HOME to a private persistent directory}:/home/steam
+      - ${STEAM_BRIDGE_BUILD:?Set STEAM_BRIDGE_BUILD to the bridge publish directory}:/opt/bridge:ro
+    restart: unless-stopped

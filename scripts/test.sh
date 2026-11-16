@@ -14,7 +14,7 @@ if ! "$python" -m unittest discover -s tests -p 'test_*.py' > .work/logs/python-
     echo 'Python tests failed. See .work/logs/python-tests.log' >&2
     exit 1
 fi
-for project in STS2Mobile.Steam.Tests STS2Mobile.Platform.Tests ModWeaver.Tests GamePatcher.Tests GamePack.Tests; do
+for project in STS2Mobile.Steam.Tests STS2Mobile.Platform.Tests ModWeaver.Tests GamePatcher.Tests GamePack.Tests SteamBridge.Tests; do
     log=".work/logs/$project.log"
     if ! dotnet test "tests/$project" > "$log" 2>&1; then
         echo "$project failed. See $log" >&2

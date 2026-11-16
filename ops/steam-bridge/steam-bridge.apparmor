@@ -1,0 +1,20 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+# Only containers explicitly selecting this profile use it. Host userns settings are unchanged.
+# Steam's bubblewrap sandbox needs nested namespaces and mount operations.
+profile sts2-steam-bridge flags=(attach_disconnected,mediate_deleted) {
+  / rw,
+  /** rwklmrix,
+  capability,
+  network,
+  unix,
+  dbus,
+  mount,
+  umount,
+  pivot_root,
+  ptrace,
+  signal,
+  userns,
+  change_profile -> sts2-steam-bridge,
+}

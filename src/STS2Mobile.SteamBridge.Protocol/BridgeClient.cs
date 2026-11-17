@@ -29,7 +29,7 @@ public sealed class BridgeClient : IAsyncDisposable
 
     public static async Task<BridgeClient> ConnectAsync(Uri endpoint, string token, ulong expectedSteamId, CancellationToken ct = default)
     {
-        if (endpoint.Scheme != "wss" || endpoint.Port != 443 || endpoint.UserInfo.Length != 0
+        if (endpoint.Scheme != "wss" || endpoint.Port != 443 || endpoint.HostNameType != UriHostNameType.Dns || endpoint.UserInfo.Length != 0
             || endpoint.Query.Length != 0 || endpoint.Fragment.Length != 0 || endpoint.AbsolutePath != "/bridge")
             throw new ArgumentException("Use wss://<your-host>/bridge on port 443.", nameof(endpoint));
         if (token.Length < 32 || token.Contains('\r') || token.Contains('\n')) throw new ArgumentException("Invalid bridge token.", nameof(token));
@@ -41,7 +41,9 @@ public sealed class BridgeClient : IAsyncDisposable
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeout.CancelAfter(TimeSpan.FromSeconds(10));
-            await socket.ConnectAsync(endpoint, timeout.Token);
+            using var transport = new SocketsHttpHandler { AllowAutoRedirect = false, UseProxy = false, UseCookies = false };
+            using var invoker = new HttpMessageInvoker(transport);
+            await socket.ConnectAsync(endpoint, invoker, timeout.Token);
             return await AttachAsync(socket, expectedSteamId, timeout.Token);
         }
         catch { socket.Dispose(); throw; }

@@ -55,6 +55,8 @@ public sealed class ProtocolTests
     [InlineData("wss://example.com/bridge?token=secret")]
     [InlineData("wss://user:password@example.com/bridge")]
     [InlineData("wss://example.com/other")]
+    [InlineData("wss://127.0.0.1/bridge")]
+    [InlineData("wss://[::1]/bridge")]
     public async Task PhoneRejectsUnsafeOrUnexpectedEndpointsBeforeConnecting(string endpoint) =>
         await Assert.ThrowsAsync<ArgumentException>(() => BridgeClient.ConnectAsync(new Uri(endpoint), new string('t', 64), 71));
 }

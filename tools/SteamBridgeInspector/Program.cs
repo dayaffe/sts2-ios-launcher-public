@@ -31,7 +31,7 @@ var report = new
     }).Where(m => m.calls.Length != 0).ToArray(),
     transportApi = allTypes.Where(t => t.Name is "NetClient" or "INetClientHandler" or "INetHandler" or "SteamClient" or "PlatformType"
         or "SteamClientConnectionInitializer" or "IClientConnectionInitializer" or "INetClientGameService" or "NetError"
-        or "NetErrorInfo" or "NetTransferMode" or "NMainMenu" or "NSubmenuStack" or "NMultiplayerSubmenu" or "NJoinFriendScreen").Select(t => new
+        or "NetErrorInfo" or "NetTransferMode" or "NMainMenu" or "NSubmenuStack" or "NMultiplayerSubmenu" or "NJoinFriendScreen" or "PeerVersionInfo").Select(t => new
     {
         type = t.FullName,
         baseType = t.BaseType?.FullName,
@@ -44,8 +44,12 @@ var report = new
     transportIl = args.Length == 2 ? allTypes.Where(t => t.FullName.Contains(".SteamClient", StringComparison.Ordinal)
         || t.Name == "SteamUtil" || t.FullName.Contains("NMainMenu/<JoinGame", StringComparison.Ordinal)
         || t.FullName.Contains("NetClientGameService", StringComparison.Ordinal)
+        || t.FullName.Contains("NetHostGameService", StringComparison.Ordinal)
+        || t.FullName.Contains("NetServerGameService", StringComparison.Ordinal)
         || t.FullName.Contains("NJoinFriendScreen", StringComparison.Ordinal)
-        || t.FullName.Contains("Multiplayer.Game.JoinFlow", StringComparison.Ordinal))
+        || t.FullName.Contains("Multiplayer.Game.JoinFlow", StringComparison.Ordinal)
+        || t.Name is "PeerVersionInfo" or "PlatformUtil" or "SteamPlatformUtilStrategy" or "NullPlatformUtilStrategy"
+        || t.Methods.Any(m => m.HasBody && m.Body.Instructions.Any(i => i.Operand is FieldReference f && f.DeclaringType.Name == "PeerVersionInfo")))
         .SelectMany(t => t.Methods).Where(m => m.HasBody).Select(m => new
         { method = m.FullName, instructions = m.Body.Instructions.Select(i => i.ToString()).ToArray() }).ToArray() : null,
 };

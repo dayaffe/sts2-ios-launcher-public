@@ -97,7 +97,7 @@ Install [AltStore](https://altstore.io) (with AltServer on the PC) or [SideStore
 own instructions, then add this source in their **Sources** tab:
 
 ```text
-https://github.com/MikeMikerson/sts2-ios-launcher-public/releases/latest/download/altstore-source.json
+https://github.com/dayaffe/sts2-ios-launcher-public/releases/latest/download/altstore-source.json
 ```
 
 Install **STS2 Mobile** from the source, then do steps 5 to 7 above. AltStore and SideStore show new releases
@@ -168,6 +168,14 @@ no touches on an iPad, after the first **Close the app**; install a newer build.
 can resize the app, so the app cannot turn the screen itself: hold the iPad sideways before starting the game,
 or it shows letterboxed in an upright window. The game, your saves and your sign-in there are kept in
 LiveContainer's own folder for the app, apart from an installed copy.
+
+## Experimental Steam bridge in this fork
+
+Version 1.2.2 includes an experimental **Steam Bridge** button for the inspected 0.113 multiplayer interface.
+It joins another player's unmodified Steam lobby through an owner-operated Linux Steam session. Configure
+your server and pair it explicitly; the app makes no bridge connection before you press Connect. Mods must
+be off, and the phone and host must have exactly the same game version. Character selection and gameplay
+with a vanilla host still need live validation. See [Linux setup, pairing and the acceptance test](ops/steam-bridge/README.md).
 
 ## Mods and multiplayer
 

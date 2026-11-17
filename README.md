@@ -171,7 +171,7 @@ LiveContainer's own folder for the app, apart from an installed copy.
 
 ## Experimental Steam bridge in this fork
 
-Version 1.2.3 includes an experimental **Steam Bridge** button for the inspected 0.113 multiplayer interface.
+Version 1.2.4 includes an experimental **Steam Bridge** button for the inspected 0.113 multiplayer interface.
 It joins another player's unmodified Steam lobby through an owner-operated Linux Steam session. Configure
 your server and pair it explicitly; Steam on the server starts only after you press Connect and closes
 when you disconnect or background the phone. Mods must

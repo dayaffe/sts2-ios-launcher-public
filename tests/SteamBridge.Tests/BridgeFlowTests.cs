@@ -332,11 +332,13 @@ public sealed class BridgeFlowTests
             await app.StartAsync();
             return new(app, backend);
         }
-        public Task<WebSocket> OpenAsync()
+        public async Task<WebSocket> OpenAsync()
         {
             var client = app.GetTestServer().CreateWebSocketClient();
             client.ConfigureRequest = request => request.Headers["Authorization"] = "Bearer " + Token;
-            return client.ConnectAsync(new Uri("http://localhost/bridge"), CancellationToken.None);
+            WebSocket socket = await client.ConnectAsync(new Uri("http://localhost/bridge"), CancellationToken.None);
+            await Backend.Attached.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            return socket;
         }
         public ValueTask DisposeAsync() => app.DisposeAsync();
     }
@@ -348,6 +350,7 @@ public sealed class BridgeFlowTests
         public Action<BridgeEvent>? Notify { get; private set; }
         public List<BridgePacket> Sent { get; } = [];
         public List<BridgeCommand> Commands { get; } = [];
+        public TaskCompletionSource Attached { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Detached { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool HoldFriends { get; set; }
         public bool HoldJoin { get; set; }
@@ -362,6 +365,7 @@ public sealed class BridgeFlowTests
             Notify = notify;
             _packet = packet;
             if (NotifyDuringAttach) notify(new("status", Status));
+            Attached.TrySetResult();
             return true;
         }
         public Task<object?> ExecuteAsync(BridgeCommand command, CancellationToken ct)

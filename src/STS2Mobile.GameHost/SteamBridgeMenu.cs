@@ -26,6 +26,8 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
     private Label _status = null!;
     private VBoxContainer _friends = null!;
     private BridgeClient? _client;
+    private BridgeClient? _gameBridge;
+    private CancellationTokenSource? _connectionStop;
     private bool _working;
     private string _savedEndpoint = "";
     private const string EndpointFile = "user://steam-bridge-endpoint.txt";
@@ -40,7 +42,8 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
         AddChild(_root);
         _open = Button("Steam Bridge", () =>
         {
-            _panel.Visible = !_panel.Visible;
+            if (_panel.Visible) ClosePanel();
+            else _panel.Visible = true;
             if (ModLaunchSettings.Enabled) _status.Text = "Turn mods off in the launcher and restart before joining unmodified games.";
         });
         _open.AnchorLeft = _open.AnchorRight = 1;
@@ -71,7 +74,8 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
             if (TryLobby(_lobby.Text, out ulong lobby)) _ = JoinAsync(lobby);
             else _status.Text = "Paste a lobby ID or a Slay the Spire 2 Steam lobby link.";
         }));
-        column.AddChild(Button("Close", () => _panel.Visible = false));
+        column.AddChild(Button("Disconnect from server", Disconnect));
+        column.AddChild(Button("Close", ClosePanel));
         scroll.AddChild(column); margin.AddChild(scroll); _panel.AddChild(margin); _root.AddChild(_panel);
         LoadEndpoint();
         _endpoint.TextChanged += text => { if (text.Trim() != _savedEndpoint) _token.Text = ""; };
@@ -81,22 +85,32 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
     {
         bool show = _game != null && IsInstanceValid(_game) && _game.MainMenu is { } menu && IsInstanceValid(menu) && menu.IsVisibleInTree();
         _root.Visible = show;
-        if (!show) _panel.Visible = false;
+        if (!show)
+        {
+            _panel.Visible = false;
+            if (_client != null) { _ = _client.DisposeAsync(); _client = null; }
+        }
     }
 
     private async Task ConnectAsync()
     {
         if (_working) return;
+        if (_gameBridge?.IsConnected == true) { _status.Text = "Disconnect the current game before opening another server session."; return; }
+        _gameBridge = null;
         if (ModLaunchSettings.Enabled) { _status.Text = "Turn mods off in the launcher and restart first."; return; }
         _working = true;
+        _connectionStop?.Dispose();
+        _connectionStop = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+        CancellationToken connecting = _connectionStop.Token;
         try
         {
-            _status.Text = "Connecting...";
+            _status.Text = "Starting Steam on your server... This can take up to 90 seconds.";
             if (_client != null) { await _client.DisposeAsync(); _client = null; }
             if (!Uri.TryCreate(_endpoint.Text.Trim(), UriKind.Absolute, out var endpoint)) throw new ArgumentException("Enter a valid server address.");
-            _client = await BridgeClient.ConnectAsync(endpoint, _token.Text.Trim(), RuntimeServices.GetLocalPlayerId(), _stop.Token);
+            _client = await BridgeClient.ConnectAsync(endpoint, _token.Text.Trim(), RuntimeServices.GetLocalPlayerId(), connecting);
+            connecting.ThrowIfCancellationRequested();
             SaveEndpoint(endpoint.AbsoluteUri, _token.Text.Trim());
-            JsonElement friends = await _client.ExecuteAsync("friends", ct: _stop.Token);
+            JsonElement friends = await _client.ExecuteAsync("friends", ct: connecting);
             foreach (Node child in _friends.GetChildren()) { _friends.RemoveChild(child); child.QueueFree(); }
             int count = 0;
             foreach (var friend in friends.EnumerateArray())
@@ -123,6 +137,7 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
         if (_client?.IsConnected != true) { _status.Text = "Connect to your server first."; return; }
         _working = true;
         var bridge = _client;
+        _gameBridge = bridge;
         _client = null;
         var initializer = new SteamBridgeConnectionInitializer(bridge, lobby);
         try
@@ -198,10 +213,29 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
         return parts.Length >= 2 && parts[0] == "2868840" && ulong.TryParse(parts[1], out lobby) && lobby != 0;
     }
 
+    private void ClosePanel()
+    {
+        _panel.Visible = false;
+        if (_gameBridge?.IsConnected != true) Disconnect();
+    }
+
+    private void Disconnect()
+    {
+        _connectionStop?.Cancel();
+        if (_client != null) { _ = _client.DisposeAsync(); _client = null; }
+        if (_gameBridge != null) { _ = _gameBridge.DisposeAsync(); _gameBridge = null; }
+        if (_status != null && IsInstanceValid(_status)) _status.Text = "Disconnected. Steam on your server will close.";
+    }
+
+    public override void _Notification(int what)
+    {
+        if (what == NotificationApplicationPaused || what == NotificationApplicationFocusOut) Disconnect();
+    }
+
     public override void _ExitTree()
     {
         _stop.Cancel();
-        if (_client != null) _ = _client.DisposeAsync();
+        Disconnect();
     }
 
     private static Button Button(string text, Action action)

@@ -1,6 +1,6 @@
 namespace STS2Mobile.SteamBridge;
 
-public sealed record BridgeOptions(string TokenFile, string Transport, ulong ExpectedSteamId, int Port)
+public sealed record BridgeOptions(string TokenFile, string Transport, ulong ExpectedSteamId, int Port, bool ManageSteam = false, bool ExitAfterSession = false)
 {
     public const uint AppId = 2868840;
 
@@ -18,6 +18,9 @@ public sealed record BridgeOptions(string TokenFile, string Transport, ulong Exp
             throw new InvalidOperationException("Bind the bridge to STEAM_BRIDGE_STEAM_ID before enabling transport.");
         int port = int.Parse(Environment.GetEnvironmentVariable("STEAM_BRIDGE_PORT") ?? "6092");
         if (port is < 1024 or > 65535) throw new InvalidOperationException("Invalid bridge port.");
-        return new(token, transport, expected, port);
+        bool manageSteam = Environment.GetEnvironmentVariable("STEAM_BRIDGE_MANAGE_STEAM") == "1";
+        if (manageSteam && !File.Exists("/.dockerenv"))
+            throw new InvalidOperationException("Steam lifecycle management requires the dedicated Docker container.");
+        return new(token, transport, expected, port, manageSteam);
     }
 }

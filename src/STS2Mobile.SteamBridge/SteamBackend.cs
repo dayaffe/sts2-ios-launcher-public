@@ -7,13 +7,14 @@ using STS2Mobile.SteamBridge.Protocol;
 namespace STS2Mobile.SteamBridge;
 
 /// <summary>All Steam API calls and callbacks run on one dedicated thread. No game simulation runs here.</summary>
-public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> logger) : BackgroundService, IBridgeBackend
+public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> logger, SteamDesktop desktop, IHostApplicationLifetime lifetime) : BackgroundService, IBridgeBackend
 {
     private readonly BlockingCollection<Action> _commands = new(128);
-    private volatile BridgeStatus _status = new(false, "waiting_for_steam", "0", "", options.Transport);
+    private volatile BridgeStatus _status = new(false, "idle", "0", "", options.Transport);
     private Action<BridgeEvent>? _notify;
     private Action<BridgePacket>? _packet;
     private int _attached;
+    private int _steamRequested;
     private long _generation;
     private bool _initialized;
     private string? _lastInitError;
@@ -34,6 +35,7 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
         _notify = notify;
         _packet = packet;
         Interlocked.Increment(ref _generation);
+        Volatile.Write(ref _steamRequested, 1);
         return true;
     }
 
@@ -45,11 +47,20 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
             while (!stoppingToken.IsCancellationRequested)
             {
                 for (int i = 0; i < 32 && _commands.TryTake(out var command); i++) command();
+                if (Volatile.Read(ref _steamRequested) == 0)
+                {
+                    if (_initialized) ShutdownSteam();
+                    SetStatus(false, "idle");
+                    stoppingToken.WaitHandle.WaitOne(20);
+                    continue;
+                }
                 if (!_initialized && DateTime.UtcNow >= nextAttempt)
                 {
-                    nextAttempt = DateTime.UtcNow.AddSeconds(5);
+                    nextAttempt = DateTime.UtcNow.AddSeconds(1);
                     try
                     {
+                        SetStatus(false, "starting_steam");
+                        desktop.Start();
                         _initialized = SteamAPI.InitEx(out string reason) == ESteamAPIInitResult.k_ESteamAPIInitResult_OK;
                         if (!_initialized && reason != _lastInitError)
                         {
@@ -90,15 +101,7 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
         }
         finally
         {
-            if (_initialized)
-            {
-                Disconnect();
-                foreach (var join in _joins) join.Cancel();
-                _socketStatus?.Dispose();
-                _messageRequest?.Dispose();
-                _legacyRequest?.Dispose();
-                SteamAPI.Shutdown();
-            }
+            ShutdownSteam();
             _initialized = false;
             SetStatus(false, "stopping");
             _commands.CompleteAdding();
@@ -157,7 +160,9 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
             await InvokeAsync<object?>(() =>
             {
                 Interlocked.Increment(ref _generation);
-                if (_initialized) Disconnect();
+                Volatile.Write(ref _steamRequested, 0);
+                ShutdownSteam();
+                SetStatus(false, "idle");
                 return null;
             }, CancellationToken.None);
         }
@@ -166,6 +171,7 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
             _notify = null;
             _packet = null;
             Interlocked.Exchange(ref _attached, 0);
+            if (options.ExitAfterSession) lifetime.StopApplication();
         }
     }
 
@@ -330,6 +336,22 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
                 for (int i = 0; i < count; i++) SteamNetworkingMessage_t.Release(messages[i]);
             }
         }
+    }
+
+    private void ShutdownSteam()
+    {
+        if (_initialized)
+        {
+            Disconnect();
+            foreach (var join in _joins) join.Cancel();
+            _joins.Clear();
+            _socketStatus?.Dispose(); _socketStatus = null;
+            _messageRequest?.Dispose(); _messageRequest = null;
+            _legacyRequest?.Dispose(); _legacyRequest = null;
+            SteamAPI.Shutdown();
+            _initialized = false;
+        }
+        desktop.Stop();
     }
 
     private void RequireReady()

@@ -29,7 +29,7 @@ PY
 dbus-run-session -- bash -c '
     openbox > "$HOME/logs/openbox.log" 2>&1 &
     x11vnc -display :99 -forever -shared -rfbauth "$HOME/.vnc/passwd" -rfbport 5900 -localhost > "$HOME/logs/vnc.log" 2>&1 &
-    steam -cef-disable-gpu > "$HOME/logs/steam.log" 2>&1 &
+    # The bridge starts Steam on demand. The private desktop remains available for sign-in maintenance.
     if [ -x /opt/bridge/STS2Mobile.SteamBridge ]; then
         mkdir -p "$HOME/bridge-state"
         printf "%s\n" 2868840 > "$HOME/bridge-state/steam_appid.txt"

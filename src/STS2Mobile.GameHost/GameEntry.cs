@@ -50,7 +50,7 @@ public sealed partial class GameEntry : Node, IGameEntry
         {
             var bridge = new SteamBridgeMenu();
             bridge.Attach(game);
-            GetTree().Root.AddChild(bridge);
+            game.AddChild(bridge);
         }
         StartAutomaticPlay();
         if (OS.GetEnvironment("STS2_PORTRAIT_PROOF").Length > 0)

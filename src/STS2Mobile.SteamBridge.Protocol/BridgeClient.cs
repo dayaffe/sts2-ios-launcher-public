@@ -36,6 +36,7 @@ public sealed class BridgeClient : IAsyncDisposable
         var socket = new ClientWebSocket();
         socket.Options.SetRequestHeader("Authorization", "Bearer " + token);
         socket.Options.KeepAliveInterval = TimeSpan.FromSeconds(15);
+        socket.Options.KeepAliveTimeout = TimeSpan.FromSeconds(15);
         socket.Options.Proxy = null;
         try
         {
@@ -44,6 +45,7 @@ public sealed class BridgeClient : IAsyncDisposable
             using var transport = new SocketsHttpHandler { AllowAutoRedirect = false, UseProxy = false, UseCookies = false };
             using var invoker = new HttpMessageInvoker(transport);
             await socket.ConnectAsync(endpoint, invoker, timeout.Token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(90));
             return await AttachAsync(socket, expectedSteamId, timeout.Token);
         }
         catch { socket.Dispose(); throw; }
@@ -63,7 +65,18 @@ public sealed class BridgeClient : IAsyncDisposable
             if (hello.GetProperty("type").GetString() != "hello" || hello.GetProperty("protocol").GetInt32() != BridgePacket.Version)
                 throw new InvalidOperationException("Unsupported bridge protocol.");
             JsonElement status = hello.GetProperty("status");
-            if (!status.GetProperty("ready").GetBoolean()) throw new InvalidOperationException("Bridge Steam session is not ready.");
+            while (!status.GetProperty("ready").GetBoolean())
+            {
+                string? state = status.GetProperty("state").GetString();
+                if (state is not ("idle" or "starting_steam" or "waiting_for_steam" or "waiting_for_login"))
+                    throw new InvalidOperationException("Bridge Steam session is not ready: " + state);
+                var update = await ReceiveAsync(socket, ct);
+                if (update.Type != WebSocketMessageType.Text) throw new InvalidOperationException("Steam startup ended before readiness.");
+                using var next = JsonDocument.Parse(update.Bytes);
+                if (next.RootElement.GetProperty("type").GetString() != "status")
+                    throw new InvalidOperationException("Unexpected response during Steam startup.");
+                status = next.RootElement.GetProperty("data").Clone();
+            }
             if (!ulong.TryParse(status.GetProperty("steamId").GetString(), NumberStyles.None, CultureInfo.InvariantCulture, out ulong actual)
                 || actual != expectedSteamId)
                 throw new InvalidOperationException("Bridge is signed in to a different Steam account.");

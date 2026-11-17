@@ -16,6 +16,7 @@ services:
       STEAM_BRIDGE_TOKEN_FILE: /home/steam/bridge-token
       STEAM_BRIDGE_TRANSPORT: ${STEAM_BRIDGE_TRANSPORT:-disabled}
       STEAM_BRIDGE_STEAM_ID: ${STEAM_BRIDGE_STEAM_ID:-}
+      STEAM_BRIDGE_MANAGE_STEAM: "1"
     ports:
       - "${STEAM_BRIDGE_DESKTOP_BIND:-127.0.0.1}:6091:6080"
       - "127.0.0.1:6092:6092"

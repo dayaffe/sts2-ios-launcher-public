@@ -200,6 +200,103 @@ public sealed class BridgeFlowTests
         Assert.DoesNotContain(fixture.Backend.Commands, c => c.Type == "connect");
     }
 
+    [Fact]
+    public async Task ColdSteamStartupWaitsForVerifiedIdentityBeforeAllowingOperations()
+    {
+        await using var fixture = await Fixture.StartAsync();
+        fixture.Backend.Status = new(false, "idle", "0", "", "sockets");
+        Task<BridgeClient> warming = BridgeClient.AttachAsync(await fixture.OpenAsync(), SteamId);
+        Assert.False(warming.IsCompleted);
+        Assert.Empty(fixture.Backend.Commands);
+        fixture.Backend.Notify!(new("status", fixture.Backend.Status with { State = "starting_steam" }));
+        fixture.Backend.Status = new(true, "ready", SteamId.ToString(), "test account", "sockets");
+        fixture.Backend.Notify!(new("status", fixture.Backend.Status));
+        await using var bridge = await warming.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Equal(SteamId, bridge.SteamId);
+        await bridge.ExecuteAsync("friends");
+        Assert.Single(fixture.Backend.Commands);
+    }
+
+    [Fact]
+    public async Task CancellingDuringColdStartupReleasesTheSteamLease()
+    {
+        await using var fixture = await Fixture.StartAsync();
+        fixture.Backend.Status = new(false, "idle", "0", "", "sockets");
+        using var stop = new CancellationTokenSource();
+        Task<BridgeClient> warming = BridgeClient.AttachAsync(await fixture.OpenAsync(), SteamId, stop.Token);
+        stop.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => warming);
+        await fixture.Backend.Detached.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Empty(fixture.Backend.Commands);
+    }
+
+    [Fact]
+    public async Task ColdStartupStillRejectsAnotherSteamAccount()
+    {
+        await using var fixture = await Fixture.StartAsync();
+        fixture.Backend.Status = new(false, "idle", "0", "", "sockets");
+        Task<BridgeClient> warming = BridgeClient.AttachAsync(await fixture.OpenAsync(), SteamId);
+        fixture.Backend.Notify!(new("status", new BridgeStatus(true, "ready", (SteamId + 1).ToString(), "another account", "sockets")));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => warming);
+        await fixture.Backend.Detached.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Empty(fixture.Backend.Commands);
+    }
+
+    [Fact]
+    public async Task PermanentGatewayStaysIdleUntilAuthenticatedAndStopsWorkerAfterDisconnect()
+    {
+        await using var worker = await Fixture.StartAsync();
+        var factory = new TestWorkerFactory(worker);
+        var gateway = new SteamSessionGateway(factory);
+        var builder = WebApplication.CreateBuilder();
+        builder.WebHost.UseTestServer(); builder.Logging.ClearProviders();
+        await using var app = builder.Build();
+        BridgeHttp.Map(app, Token, () => gateway.Status, gateway.RunAsync);
+        await app.StartAsync();
+        using var http = app.GetTestClient();
+        Assert.Contains("idle", await http.GetStringAsync("/health"));
+        Assert.Equal(HttpStatusCode.Unauthorized, (await http.GetAsync("/bridge")).StatusCode);
+        Assert.Equal(0, factory.Starts);
+        var sockets = app.GetTestServer().CreateWebSocketClient();
+        sockets.ConfigureRequest = request => request.Headers["Authorization"] = "Bearer " + Token;
+        await using var phone = await BridgeClient.AttachAsync(await sockets.ConnectAsync(new Uri("http://localhost/bridge"), CancellationToken.None), SteamId);
+        await phone.ExecuteAsync("friends");
+        var echoed = new TaskCompletionSource<BridgePacket>(TaskCreationOptions.RunContinuationsAsynchronously);
+        phone.PacketReceived += packet => echoed.TrySetResult(packet);
+        byte[] bytes = new byte[BridgePacket.MaxPayload]; new Random(17).NextBytes(bytes);
+        await phone.SendPacketAsync(new(HostId, 0, true, bytes));
+        Assert.Equal(bytes, (await echoed.Task.WaitAsync(TimeSpan.FromSeconds(3))).Payload);
+        Assert.Equal(1, factory.Starts);
+        using var second = await sockets.ConnectAsync(new Uri("http://localhost/bridge"), CancellationToken.None);
+        Assert.Equal(WebSocketMessageType.Close, (await second.ReceiveAsync(new byte[1024].AsMemory(), CancellationToken.None)).MessageType);
+        Assert.Equal(1, factory.Starts);
+        await phone.DisposeAsync();
+        await factory.Stopped.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        using var idleDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        while (gateway.Status.State != "idle") await Task.Delay(5, idleDeadline.Token);
+        Assert.Equal("idle", gateway.Status.State);
+    }
+
+    private sealed class TestWorkerFactory(Fixture worker) : ISteamWorkerFactory
+    {
+        public int Starts;
+        public TaskCompletionSource Stopped { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public async Task<ISteamWorkerSession> OpenAsync(CancellationToken ct)
+        {
+            Interlocked.Increment(ref Starts);
+            return new TestWorkerSession(await worker.OpenAsync(), this);
+        }
+        private sealed class TestWorkerSession(WebSocket socket, TestWorkerFactory owner) : ISteamWorkerSession
+        {
+            public WebSocket Socket => socket;
+            public ValueTask DisposeAsync()
+            {
+                socket.Abort(); socket.Dispose(); owner.Stopped.TrySetResult();
+                return ValueTask.CompletedTask;
+            }
+        }
+    }
+
     private sealed class GameHandler : INetClientGameService
     {
         public NetClient? Client;
@@ -258,7 +355,7 @@ public sealed class BridgeFlowTests
         public TaskCompletionSource JoinStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool NotifyDuringAttach { get; set; }
         public TaskCompletionSource FriendsStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public BridgeStatus Status => new(true, "ready", SteamId.ToString(), "test account", "sockets");
+        public BridgeStatus Status { get; set; } = new(true, "ready", SteamId.ToString(), "test account", "sockets");
         public bool TryAttach(Action<BridgeEvent> notify, Action<BridgePacket> packet)
         {
             if (Interlocked.CompareExchange(ref _attached, 1, 0) != 0) return false;

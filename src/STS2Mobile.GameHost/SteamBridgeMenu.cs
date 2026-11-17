@@ -91,7 +91,7 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
         var update = Interlocked.Exchange(ref _pendingFriends, null);
         if (update != null && _client?.IsConnected == true) RenderFriends(update.Friends);
         if (Interlocked.Exchange(ref _serverDisconnected, 0) != 0 && _client?.IsConnected != true)
-            _status.Text = "Server connection ended. Connect again to refresh Steam and rejoin.";
+            _status.Text = "Server connection ended. " + (_client?.LastDisconnectReason ?? "Connect again to rejoin.");
         _root.Visible = show;
         if (!show)
         {
@@ -174,7 +174,7 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
             : "Connected. Waiting for Steam to advertise a joinable lobby or deliver an invitation. Refresh, ask your friend to send a new invite while connected, or paste their lobby link.";
     }
 
-    private void OnMenuEvent(JsonElement message)
+    private void OnMenuEvent(BridgeNotification message)
     {
         if (message.GetProperty("type").GetString() == "friends")
             Interlocked.Exchange(ref _pendingFriends, new FriendUpdate(message.GetProperty("data").Clone()));
@@ -205,12 +205,20 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
         }
         catch (Exception error)
         {
-            _status.Text = "The game could not join that lobby. Check that your friend is hosting the same game version.";
-            GD.Print("Steam bridge join: ", error.GetType().Name);
+            GD.Print("Steam bridge join: ", error);
+            var cause = error.InnerException ?? error;
+            _status.Text = "Could not start joining: " + cause.GetType().Name + ": " + cause.Message;
+            _panel.Visible = true;
         }
         finally
         {
             await initializer.ReleaseIfUnusedAsync();
+            if (initializer.FailureDetail is { } detail)
+            {
+                GD.Print("Steam bridge join failure: ", detail);
+                _status.Text = initializer.FailureMessage;
+                _panel.Visible = true;
+            }
             _working = false;
         }
     }
@@ -224,6 +232,8 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
         Type screenType = menuType.Assembly.GetType("MegaCrit.Sts2.Core.Nodes.Screens.MainMenu.NJoinFriendScreen", true)!;
         object stack = menuType.GetProperty("SubmenuStack")!.GetValue(menu)!;
         object screen = stack.GetType().GetMethod("GetSubmenuType", [typeof(Type)])!.Invoke(stack, [screenType])!;
+        // Push normally assigns the menu stack before opening a screen. Preserve that setup without its TCP fallback.
+        screenType.GetMethod("SetStack", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic)!.Invoke(screen, [stack]);
         return (Task)screenType.GetMethod("JoinGameAsync", [typeof(IClientConnectionInitializer)])!.Invoke(screen, [initializer])!;
     }
 

@@ -24,7 +24,8 @@ public sealed class BridgeClient : IAsyncDisposable
     public ulong SteamId { get; private set; }
     public bool IsConnected => !_stop.IsCancellationRequested && _socket.State == WebSocketState.Open;
     public event Action<BridgePacket>? PacketReceived;
-    public event Action<JsonElement>? EventReceived;
+    public event Action<BridgeNotification>? EventReceived;
+    public string? LastDisconnectReason { get; private set; }
     public event Action? Disconnected;
 
     public static async Task<BridgeClient> ConnectAsync(Uri endpoint, string token, ulong expectedSteamId, CancellationToken ct = default)
@@ -142,19 +143,20 @@ public sealed class BridgeClient : IAsyncDisposable
                         if (!status.GetProperty("ready").GetBoolean() || status.GetProperty("steamId").GetString() != SteamId.ToString(CultureInfo.InvariantCulture))
                             throw new InvalidOperationException("Bridge Steam identity or availability changed.");
                     }
-                    EventReceived?.Invoke(response.Clone());
+                    EventReceived?.Invoke(new BridgeNotification(response.Clone()));
                 }
             }
         }
-        catch (Exception error) when (error is OperationCanceledException or WebSocketException or JsonException or ArgumentException or InvalidOperationException)
+        catch (Exception error)
         {
-            // The transport ending must fail every outstanding request; game actions are never replayed.
+            // Keep the local cause available to the UI; never send or log credentials or packet contents.
+            LastDisconnectReason = error is OperationCanceledException ? "Connection cancelled." : error.GetType().Name + ": " + error.Message;
         }
         finally
         {
             _stop.Cancel();
             _socket.Abort();
-            foreach (var answer in _pending.Values) answer.TrySetException(new InvalidOperationException("Bridge disconnected."));
+            foreach (var answer in _pending.Values) answer.TrySetException(new InvalidOperationException("Bridge disconnected. " + LastDisconnectReason));
             _pending.Clear();
             Disconnected?.Invoke();
         }

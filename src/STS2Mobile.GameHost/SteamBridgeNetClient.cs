@@ -24,7 +24,10 @@ internal sealed class SteamBridgeNetClient : NetClient
     private readonly CancellationTokenSource _stop = new();
     private readonly ConcurrentQueue<BridgePacket> _incoming = new();
     private readonly Channel<BridgePacket> _outgoing = Channel.CreateBounded<BridgePacket>(64);
-    private readonly TaskCompletionSource _nativeConnected = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly BridgeConnectionSignal _nativeConnected = new();
+    public string? FailureDetail { get; private set; }
+    public string? FailureMessage { get; private set; }
+    private string _phase = "joining the Steam lobby";
     private Task _sending = Task.CompletedTask;
     private bool _connected;
     private ulong _host;
@@ -54,21 +57,28 @@ internal sealed class SteamBridgeNetClient : NetClient
         {
             JsonElement joined = await _bridge.ExecuteAsync("join", _lobby.ToString(CultureInfo.InvariantCulture), ct: linked.Token);
             _host = ulong.Parse(joined.GetProperty("ownerId").GetString()!, CultureInfo.InvariantCulture);
+            _phase = "opening the Steam connection";
             await _bridge.ExecuteAsync("connect", virtualPort: 0, channels: [0], ct: linked.Token);
-            await _nativeConnected.Task.WaitAsync(TimeSpan.FromSeconds(20), linked.Token);
+            _phase = "waiting for Steam to connect";
+            await _nativeConnected.WaitAsync(TimeSpan.FromSeconds(20), linked.Token);
             if (Volatile.Read(ref _lost) != 0) throw new InvalidOperationException("Steam connection ended while joining.");
             _connected = true;
             _sending = SendLoopAsync();
+            _phase = "starting the game handshake";
             _gameHandler.OnConnectedToHost();
             return null;
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException error)
         {
+            FailureDetail = "Join was cancelled while " + _phase + ". " + error.Message;
+            FailureMessage = "Join was cancelled while " + _phase + ".";
             Close();
             return Error("CancelledJoin", true);
         }
-        catch (Exception error) when (error is InvalidOperationException or TimeoutException or System.Net.WebSockets.WebSocketException)
+        catch (Exception error)
         {
+            FailureDetail = "Failed while " + _phase + ": " + error;
+            FailureMessage = "Failed while " + _phase + ": " + error.GetType().Name + ": " + error.Message;
             Close();
             return Error("UnknownNetworkError");
         }
@@ -116,13 +126,13 @@ internal sealed class SteamBridgeNetClient : NetClient
         _incoming.Enqueue(packet);
     }
 
-    private void OnBridgeEvent(JsonElement response)
+    private void OnBridgeEvent(BridgeNotification response)
     {
         string? type = response.GetProperty("type").GetString();
         if (type == "connection")
         {
             string? state = response.GetProperty("data").GetProperty("state").GetString();
-            if (state == "k_ESteamNetworkingConnectionState_Connected") _nativeConnected.TrySetResult();
+            if (state == "k_ESteamNetworkingConnectionState_Connected") _nativeConnected.Connected();
             else if (state is "k_ESteamNetworkingConnectionState_ClosedByPeer" or "k_ESteamNetworkingConnectionState_ProblemDetectedLocally") Lost();
         }
         else if (type == "transport_error") Lost();
@@ -131,7 +141,7 @@ internal sealed class SteamBridgeNetClient : NetClient
     private void Lost()
     {
         Interlocked.Exchange(ref _lost, 1);
-        _nativeConnected.TrySetException(new InvalidOperationException("Steam bridge connection ended."));
+        _nativeConnected.Failed("Steam bridge connection ended. " + (_bridge.LastDisconnectReason ?? ""));
     }
 
     private async Task SendLoopAsync()
@@ -147,6 +157,7 @@ internal sealed class SteamBridgeNetClient : NetClient
     private void Close()
     {
         if (Interlocked.Exchange(ref _closed, 1) != 0) return;
+        _connected = false;
         _stop.Cancel();
         _outgoing.Writer.TryComplete();
         _bridge.PacketReceived -= Receive;
@@ -168,6 +179,8 @@ internal sealed class SteamBridgeNetClient : NetClient
 internal sealed class SteamBridgeConnectionInitializer(BridgeClient bridge, ulong lobby) : IClientConnectionInitializer
 {
     private SteamBridgeNetClient? _client;
+    public string? FailureDetail => _client?.FailureDetail;
+    public string? FailureMessage => _client?.FailureMessage;
     public PlatformType Platform => PlatformType.Steam;
     public ulong? GetHostId() => _client?.HostNetId is > 0 and var id ? id : null;
     public Task<NetErrorInfo?> Connect(INetClientGameService gameService, CancellationToken cancelToken = default)
@@ -176,5 +189,5 @@ internal sealed class SteamBridgeConnectionInitializer(BridgeClient bridge, ulon
         gameService.Initialize(_client, PlatformType.Steam);
         return _client.ConnectAsync(cancelToken);
     }
-    public ValueTask ReleaseIfUnusedAsync() => _client == null ? bridge.DisposeAsync() : ValueTask.CompletedTask;
+    public ValueTask ReleaseIfUnusedAsync() => _client?.IsConnected == true ? ValueTask.CompletedTask : bridge.DisposeAsync();
 }

@@ -297,14 +297,76 @@ public sealed class BridgeFlowTests
         }
     }
 
+    [Fact]
+    public async Task GameAdapterKeepsTheBridgeOpenWhileSteamIsFindingARoute()
+    {
+        await using var fixture = await Fixture.StartAsync();
+        await using var bridge = await BridgeClient.AttachAsync(await fixture.OpenAsync(), SteamId);
+        var game = new GameHandler();
+        var initializer = new SteamBridgeConnectionInitializer(bridge, 109775240000000001);
+        Task<NetErrorInfo?> connecting = initializer.Connect(game);
+        await fixture.Backend.ConnectStarted.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        fixture.Backend.Notify!(new("connection", new { state = "k_ESteamNetworkingConnectionState_Connecting" }));
+        fixture.Backend.Notify!(new("connection", new { state = "k_ESteamNetworkingConnectionState_FindingRoute" }));
+        await Task.Delay(50);
+        Assert.False(connecting.IsCompleted);
+        Assert.True(bridge.IsConnected);
+        Assert.False(fixture.Backend.Detached.Task.IsCompleted);
+        fixture.Backend.Notify!(new("connection", new { state = "k_ESteamNetworkingConnectionState_Connected" }));
+        Assert.Null(await connecting.WaitAsync(TimeSpan.FromSeconds(3)));
+        Assert.Equal(1, game.Connected);
+        game.Client!.DisconnectFromHost(NetError.Quit);
+        await fixture.Backend.Detached.Task.WaitAsync(TimeSpan.FromSeconds(3));
+    }
+
+    [Fact]
+    public async Task NotificationFailurePreservesTheCauseAndReleasesPendingSteamOperations()
+    {
+        await using var fixture = await Fixture.StartAsync();
+        await using var bridge = await BridgeClient.AttachAsync(await fixture.OpenAsync(), SteamId);
+        fixture.Backend.HoldFriends = true;
+        Task<JsonElement> pending = bridge.ExecuteAsync("friends");
+        await fixture.Backend.FriendsStarted.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        bridge.EventReceived += _ => throw new NotSupportedException("Notification callback unavailable.");
+        fixture.Backend.Notify!(new("connection", new { state = "k_ESteamNetworkingConnectionState_Connecting" }));
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => pending.WaitAsync(TimeSpan.FromSeconds(3)));
+        Assert.Contains("NotSupportedException: Notification callback unavailable.", error.Message);
+        Assert.Contains("NotSupportedException", bridge.LastDisconnectReason);
+        await fixture.Backend.Detached.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.False(bridge.IsConnected);
+        Assert.Empty(fixture.Backend.Sent);
+    }
+
+    [Fact]
+    public async Task GameHandshakeStartupFailureReportsItsStageAndClosesTheSession()
+    {
+        await using var fixture = await Fixture.StartAsync();
+        fixture.Backend.ConnectImmediately = true;
+        await using var bridge = await BridgeClient.AttachAsync(await fixture.OpenAsync(), SteamId);
+        var game = new GameHandler { FailHandshake = true };
+        var initializer = new SteamBridgeConnectionInitializer(bridge, 109775240000000001);
+        var result = await initializer.Connect(game).WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Equal(NetError.UnknownNetworkError, result!.Value.Reason);
+        Assert.Contains("starting the game handshake", initializer.FailureMessage);
+        Assert.Contains("NotSupportedException: Handshake callback unavailable.", initializer.FailureMessage);
+        Assert.Contains(nameof(GameHandler.OnConnectedToHost), initializer.FailureDetail);
+        Assert.False(game.Client!.IsConnected);
+        await fixture.Backend.Detached.Task.WaitAsync(TimeSpan.FromSeconds(3));
+    }
+
     private sealed class GameHandler : INetClientGameService
     {
         public NetClient? Client;
         public PlatformType Platform;
         public int Connected, Disconnected;
+        public bool FailHandshake;
         public List<(byte[] Bytes, NetTransferMode Mode, int Channel)> Packets = [];
         public void Initialize(NetClient client, PlatformType platform) { Client = client; Platform = platform; }
-        public void OnConnectedToHost() => Connected++;
+        public void OnConnectedToHost()
+        {
+            if (FailHandshake) throw new NotSupportedException("Handshake callback unavailable.");
+            Connected++;
+        }
         public void OnDisconnectedFromHost(ulong peer, NetErrorInfo info) => Disconnected++;
         public void OnPacketReceived(ulong peer, byte[] bytes, NetTransferMode mode, int channel) => Packets.Add((bytes, mode, channel));
     }
@@ -355,6 +417,7 @@ public sealed class BridgeFlowTests
         public bool HoldFriends { get; set; }
         public bool HoldJoin { get; set; }
         public bool ConnectImmediately { get; set; }
+        public TaskCompletionSource ConnectStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource JoinStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool NotifyDuringAttach { get; set; }
         public TaskCompletionSource FriendsStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -372,6 +435,7 @@ public sealed class BridgeFlowTests
         {
             Commands.Add(command);
             if (command.Type == "join" && HoldJoin) { JoinStarted.TrySetResult(); return HoldAsync(ct); }
+            if (command.Type == "connect") ConnectStarted.TrySetResult();
             if (command.Type == "connect" && ConnectImmediately)
                 Notify!(new("connection", new { state = "k_ESteamNetworkingConnectionState_Connected" }));
             if (command.Type == "friends" && HoldFriends)

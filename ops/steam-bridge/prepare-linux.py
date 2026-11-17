@@ -74,15 +74,29 @@ def main():
          '--self-contained', 'true', '-o', str(PUBLISH)])
     (PUBLISH / 'libsteam_api.so').write_bytes(verified_download(NATIVE_URL, NATIVE_SHA256))
     env_file = WORK / 'compose.env'
-    env_file.write_text(f'STEAM_BRIDGE_HOME={DATA}\nSTEAM_BRIDGE_BUILD={PUBLISH}\nSTEAM_BRIDGE_SECCOMP={seccomp}\n')
-    desktop_bind = os.environ.get('STEAM_BRIDGE_DESKTOP_BIND', '127.0.0.1')
+    previous = {}
+    if env_file.exists():
+        previous = dict(line.split('=', 1) for line in env_file.read_text().splitlines()
+                        if line.startswith(('STEAM_BRIDGE_DESKTOP_BIND=', 'STEAM_BRIDGE_TRANSPORT=', 'STEAM_BRIDGE_STEAM_ID=')))
+    def setting(name, default):
+        return os.environ.get(name, previous.get(name, default))
+    desktop_bind = setting('STEAM_BRIDGE_DESKTOP_BIND', '127.0.0.1')
     if desktop_bind != '127.0.0.1':
         import ipaddress
         address = ipaddress.ip_address(desktop_bind)
         if address not in ipaddress.ip_network('100.64.0.0/10'):
             raise ValueError('Remote desktop binds must be a private tailnet address.')
-        with env_file.open('a') as stream:
-            stream.write(f'STEAM_BRIDGE_DESKTOP_BIND={desktop_bind}\n')
+    transport = setting('STEAM_BRIDGE_TRANSPORT', 'disabled')
+    steam_id = setting('STEAM_BRIDGE_STEAM_ID', '')
+    if transport not in ('disabled', 'sockets', 'messages', 'legacy'):
+        raise ValueError('Unsupported STEAM_BRIDGE_TRANSPORT.')
+    if steam_id and (not steam_id.isascii() or not steam_id.isdecimal() or not 0 < int(steam_id) < 2**64):
+        raise ValueError('STEAM_BRIDGE_STEAM_ID must be a valid Steam ID.')
+    if transport != 'disabled' and not steam_id:
+        raise ValueError('Pin STEAM_BRIDGE_STEAM_ID before enabling gameplay forwarding.')
+    env_file.write_text(f'STEAM_BRIDGE_HOME={DATA}\nSTEAM_BRIDGE_BUILD={PUBLISH}\nSTEAM_BRIDGE_SECCOMP={seccomp}\n'
+                        f'STEAM_BRIDGE_DESKTOP_BIND={desktop_bind}\nSTEAM_BRIDGE_TRANSPORT={transport}\n'
+                        f'STEAM_BRIDGE_STEAM_ID={steam_id}\n')
     if args.desktop or args.load_profile:
         run(['docker', 'build', '-t', IMAGE, 'ops/steam-bridge'])
     if args.load_profile:
@@ -95,9 +109,9 @@ def main():
              '--entrypoint', 'bash', IMAGE, '-c',
              'x11vnc -storepasswd "$(cat /home/steam/.vnc/password)" /home/steam/.vnc/passwd >/dev/null'])
         run(['docker', 'compose', '--env-file', str(env_file), '-f', 'ops/steam-bridge/compose.yaml', 'up', '-d'])
-        print('Steam desktop: http://127.0.0.1:6091/vnc.html?autoconnect=1&resize=scale')
+        print(f'Steam desktop: http://{desktop_bind}:6091/vnc.html?autoconnect=1&resize=scale')
         print('VNC password file:', DATA / '.vnc/password')
-        print('Bridge health: http://127.0.0.1:6092/health (gameplay forwarding disabled)')
+        print(f'Bridge health: http://127.0.0.1:6092/health (transport: {transport})')
     print('Prepared bridge:', PUBLISH)
 
 

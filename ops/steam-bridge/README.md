@@ -25,7 +25,7 @@ python3 ops/steam-bridge/prepare-linux.py --desktop --load-profile
 
 `--load-profile` runs a short-lived privileged Docker helper that loads **only** `sts2-steam-bridge` into AppArmor. It writes no host sysctl and changes no other AppArmor profile. Steam itself runs as uid 1000, with no effective capabilities. A `SYS_ADMIN` bounding capability enables namespace syscalls in Docker's default seccomp policy. The prepared syscall profile is Moby's pinned default plus `pivot_root`, required by bubblewrap. The named AppArmor profile permits Steam's nested sandbox; `aa-exec` removes the extra unconfined label that otherwise sends Ubuntu 26.04's children into `unprivileged_userns`.
 
-The AppArmor profile must be loaded again after reboot before starting this container. The setup command preserves existing tokens and Steam data. App state defaults to `~/.local/state/sts2-steam-bridge`, mode 0700; it is outside the checkout. Set `STEAM_BRIDGE_HOME` to choose another private directory. The current Compose image assumes host uid 1000.
+The AppArmor profile must be loaded again after reboot before starting this container. The setup command preserves existing tokens, Steam data and the selected transport, account pin and desktop bind in the ignored `.work/steam-bridge/compose.env`. Explicit `STEAM_BRIDGE_*` environment values override those settings on a later setup run. App state defaults to `~/.local/state/sts2-steam-bridge`, mode 0700; it is outside the checkout. Set `STEAM_BRIDGE_HOME` to choose another private directory. The current Compose image assumes host uid 1000.
 
 By default only loopback ports are published:
 

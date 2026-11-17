@@ -43,6 +43,15 @@ public sealed partial class GameEntry : Node, IGameEntry
         if (game.MainMenu == null) throw new InvalidOperationException("The game did not reach its main menu.");
         _game = game;
         _graphics.GameStarted();
+        // The pre-0.113 initializer has a different ABI. Only offer the experimental bridge with the inspected interface.
+        var initializer = game.GetType().Assembly.GetType("MegaCrit.Sts2.Core.Multiplayer.Connection.IClientConnectionInitializer");
+        if (initializer?.GetMethod("Connect")?.GetParameters().FirstOrDefault()?.ParameterType.FullName ==
+            "MegaCrit.Sts2.Core.Multiplayer.Game.INetClientGameService")
+        {
+            var bridge = new SteamBridgeMenu();
+            bridge.Attach(game);
+            GetTree().Root.AddChild(bridge);
+        }
         StartAutomaticPlay();
         if (OS.GetEnvironment("STS2_PORTRAIT_PROOF").Length > 0)
             _ = RunPortraitProofAfterLauncherHidesAsync(game);

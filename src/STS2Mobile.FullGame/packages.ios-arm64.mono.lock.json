@@ -67,7 +67,8 @@
         "dependencies": {
           "Godot.SourceGenerators": "[4.5.1, )",
           "GodotSharp": "[4.5.1, )",
-          "STS2Mobile.Platform": "[1.0.0, )"
+          "STS2Mobile.Platform": "[1.0.0, )",
+          "STS2Mobile.SteamBridge.Protocol": "[1.0.0, )"
         }
       },
       "sts2mobile.gamepack": {
@@ -98,6 +99,9 @@
         "dependencies": {
           "SteamKit2": "[3.4.0, )"
         }
+      },
+      "sts2mobile.steambridge.protocol": {
+        "type": "Project"
       },
       "sts2mobile.steamwire": {
         "type": "Project",

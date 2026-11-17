@@ -7,7 +7,8 @@ public sealed record BridgePacket(ulong PeerId, int Channel, bool Reliable, byte
 {
     public const int Version = 1;
     public const int HeaderSize = 16;
-    public const int MaxPayload = 64 * 1024;
+    // Valve's SteamNetworkingSockets message limit. Lobby/save handshakes may exceed a small chat packet.
+    public const int MaxPayload = 512 * 1024;
     public const int MaxChannel = 255;
 
     public byte[] Encode()

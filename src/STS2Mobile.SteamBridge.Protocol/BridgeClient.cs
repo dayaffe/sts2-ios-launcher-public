@@ -66,7 +66,7 @@ public sealed class BridgeClient : IAsyncDisposable
                 || actual != expectedSteamId)
                 throw new InvalidOperationException("Bridge is signed in to a different Steam account.");
             client.SteamId = actual;
-            client._receiving = client.ReadLoopAsync();
+            client._receiving = Task.Run(client.ReadLoopAsync);
             return client;
         }
         catch { socket.Abort(); socket.Dispose(); client._stop.Dispose(); throw; }
@@ -77,7 +77,7 @@ public sealed class BridgeClient : IAsyncDisposable
         if (!IsConnected) throw new InvalidOperationException("Bridge is disconnected.");
         string id = Guid.NewGuid().ToString("N");
         var command = new BridgeCommand(id, type, lobbyId, virtualPort, channels);
-        byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(command, BridgeCommand.Json);
+        byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(command, BridgeJsonContext.Default.BridgeCommand);
         BridgeCommand.Parse(bytes);
         var answer = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pending[id] = answer;

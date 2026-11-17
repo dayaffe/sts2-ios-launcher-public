@@ -3,14 +3,15 @@ using System.Text.Json;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 
-if (args.Length != 1 || !File.Exists(args[0]))
+if (args.Length is < 1 or > 2 || !File.Exists(args[0]) || (args.Length == 2 && args[1] != "--include-transport-il"))
 {
-    Console.Error.WriteLine("Usage: SteamBridgeInspector <owned desktop sts2.dll>");
+    Console.Error.WriteLine("Usage: SteamBridgeInspector <owned desktop sts2.dll> [--include-transport-il]");
     return 2;
 }
-// Read metadata without loading or executing any code from the game. No method bodies are exported.
+// Read metadata without loading or executing game code. Detailed transport IL is opt-in for private inspection only.
 using var assembly = AssemblyDefinition.ReadAssembly(args[0]);
-var types = assembly.MainModule.Types.SelectMany(Walk).Where(t => t.FullName.Contains("Multiplayer", StringComparison.Ordinal)
+var allTypes = assembly.MainModule.Types.SelectMany(Walk).ToArray();
+var types = allTypes.Where(t => t.FullName.Contains("Multiplayer", StringComparison.Ordinal)
     || t.FullName.Contains("Platform.Steam", StringComparison.Ordinal)).ToArray();
 var report = new
 {
@@ -28,14 +29,25 @@ var report = new
             or Code.Ldc_I4_0 or Code.Ldc_I4_1 or Code.Ldc_I4_2 or Code.Ldc_I4_3 or Code.Ldc_I4_4
             or Code.Ldc_I4_5 or Code.Ldc_I4_6 or Code.Ldc_I4_7 or Code.Ldc_I4_8).Select(i => i.ToString()).ToArray(),
     }).Where(m => m.calls.Length != 0).ToArray(),
-    transportApi = types.Where(t => t.Name is "NetClient" or "INetClientHandler" or "INetHandler" or "SteamClient"
+    transportApi = allTypes.Where(t => t.Name is "NetClient" or "INetClientHandler" or "INetHandler" or "SteamClient" or "PlatformType"
         or "SteamClientConnectionInitializer" or "IClientConnectionInitializer" or "INetClientGameService" or "NetError"
-        or "NetErrorInfo" or "NetTransferMode").Select(t => new
+        or "NetErrorInfo" or "NetTransferMode" or "NMainMenu" or "NSubmenuStack" or "NMultiplayerSubmenu" or "NJoinFriendScreen").Select(t => new
     {
         type = t.FullName,
-        fields = t.Fields.Where(f => f.IsPublic || f.IsFamily).Select(f => new { name = f.FullName, constant = f.Constant }).ToArray(),
+        baseType = t.BaseType?.FullName,
+        interfaces = t.Interfaces.Select(i => i.InterfaceType.FullName).ToArray(),
+        fields = t.Fields.Where(f => f.IsPublic || f.IsFamily || t.Name is "NMainMenu" or "NJoinFriendScreen").Select(f => new { name = f.FullName, constant = f.Constant }).ToArray(),
         methods = t.Methods.Select(m => new { name = m.FullName, m.IsVirtual, m.IsAbstract, m.IsPublic, m.IsFamily }).ToArray(),
     }).ToArray(),
+    joinEntryPoints = allTypes.SelectMany(t => t.Methods).Where(m => m.Parameters.Any(p => p.ParameterType.FullName.Contains("IClientConnectionInitializer", StringComparison.Ordinal)))
+        .Select(m => new { method = m.FullName, m.IsStatic, m.IsPublic }).ToArray(),
+    transportIl = args.Length == 2 ? allTypes.Where(t => t.FullName.Contains(".SteamClient", StringComparison.Ordinal)
+        || t.Name == "SteamUtil" || t.FullName.Contains("NMainMenu/<JoinGame", StringComparison.Ordinal)
+        || t.FullName.Contains("NetClientGameService", StringComparison.Ordinal)
+        || t.FullName.Contains("NJoinFriendScreen", StringComparison.Ordinal)
+        || t.FullName.Contains("Multiplayer.Game.JoinFlow", StringComparison.Ordinal))
+        .SelectMany(t => t.Methods).Where(m => m.HasBody).Select(m => new
+        { method = m.FullName, instructions = m.Body.Instructions.Select(i => i.ToString()).ToArray() }).ToArray() : null,
 };
 Console.WriteLine(JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true }));
 return 0;

@@ -31,6 +31,9 @@
       },
       "sts2mobile.platform": {
         "type": "Project"
+      },
+      "sts2mobile.steambridge.protocol": {
+        "type": "Project"
       }
     }
   }

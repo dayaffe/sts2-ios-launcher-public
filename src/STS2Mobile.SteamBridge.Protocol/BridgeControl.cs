@@ -10,7 +10,7 @@ public sealed record BridgeCommand(string Id, string Type, string? LobbyId = nul
     public static BridgeCommand Parse(ReadOnlySpan<byte> bytes)
     {
         if (bytes.Length > 8192) throw new ArgumentException("Control message is too large.");
-        var command = JsonSerializer.Deserialize<BridgeCommand>(bytes, Json) ?? throw new ArgumentException("Missing command.");
+        var command = JsonSerializer.Deserialize(bytes, BridgeJsonContext.Default.BridgeCommand) ?? throw new ArgumentException("Missing command.");
         if (string.IsNullOrWhiteSpace(command.Id) || command.Id.Length > 64 || command.Type is not ("status" or "friends" or "join" or "connect" or "disconnect"))
             throw new ArgumentException("Unknown command or invalid request ID.");
         if (command.Type == "join" && (!ulong.TryParse(command.LobbyId, out ulong lobby) || lobby == 0))

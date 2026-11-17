@@ -9,6 +9,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../STS2Mobile.Platform/STS2Mobile.Platform.csproj" />
+    <ProjectReference Include="../STS2Mobile.SteamBridge.Protocol/STS2Mobile.SteamBridge.Protocol.csproj" />
     <!-- Compile only: the stub must never reach a publish folder or a project that references this one. -->
     <ProjectReference Include="../STS2Mobile.GameStub/STS2Mobile.GameStub.csproj" Private="false" PrivateAssets="all" />
   </ItemGroup>

@@ -14,7 +14,7 @@ public static class BridgeSession
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(stopped);
         CancellationToken ct = cancellation.Token;
-        var outgoing = Channel.CreateBounded<Outgoing>(new BoundedChannelOptions(256) { FullMode = BoundedChannelFullMode.Wait, SingleReader = true });
+        var outgoing = Channel.CreateBounded<Outgoing>(new BoundedChannelOptions(64) { FullMode = BoundedChannelFullMode.Wait, SingleReader = true });
         void Enqueue(Outgoing frame)
         {
             if (!outgoing.Writer.TryWrite(frame))

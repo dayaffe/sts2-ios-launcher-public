@@ -2,7 +2,7 @@
 
 Goal: an iPhone running the game locally joins a friend's **unmodified** Steam game through a Linux machine that owns the Steam networking session. The server does not simulate the game or stream video.
 
-This is a prototype. It is **not included or enabled in the v1.2.1 IPA**. The server, shared phone-side client and protocol have automated integration coverage with an in-process test backend; a live vanilla-game handshake has not been verified. Gameplay forwarding defaults to `disabled`. Do not call this working vanilla multiplayer until the acceptance test below passes.
+This is a prototype. It is **not included or enabled in the v1.2.1 IPA**. The server, phone-side transport adapter, pairing UI and protocol have automated integration coverage with an in-process test backend; a live vanilla-game handshake has not been verified. Gameplay forwarding defaults to `disabled`. Do not call this working vanilla multiplayer until the acceptance test below passes.
 
 ## Components
 
@@ -11,7 +11,9 @@ This is a prototype. It is **not included or enabled in the v1.2.1 IPA**. The se
 - `tools/SteamBridgeInspector`: reads the owner's desktop `sts2.dll` as metadata, without executing it. Reports the assembly hash, Steam API call sites, channel/port constants and the public/protected transport API. Reports and game inputs stay in ignored local directories.
 - This folder: isolated Steam desktop with browser/VNC access, reproducible dependency downloads, and container-specific namespace settings.
 
-The app's `NetClient` adapter, connection settings UI and vanilla lobby entry point still require implementation against the inspected game API. The experimental server backends (`sockets`, `messages`, `legacy`) are diagnostic implementations; the exact API, reliability and channel framing must be selected from the game inspection, not guessed. In particular the legacy receive API does not expose reliability, so it is not a validated gameplay backend.
+The experimental branch includes a `Steam Bridge` button in the game's main menu for the inspected 0.113 multiplayer interface. Pair it with your own server, then choose a hosting friend or paste a Steam lobby link. The pairing token is stored in the iPhone's device-only Keychain and is bound to the selected endpoint. The UI requires mods to be off. It invokes the game's normal join flow on its cached screen without opening the desktop friend picker, whose automatic fallback would create a competing transport.
+
+The owned Linux public-beta v0.113.1 assembly was inspected: its SteamClient uses SteamNetworkingSockets.ConnectP2P on virtual port 0, sends the original packet bytes with flags 0 (unreliable) or 8 (reliable), ignores the outgoing game channel argument, and receives the native message's channel. The bridge and phone adapter implement that mapping with `sockets`. This establishes transport framing, not a successful vanilla handshake. The other diagnostic backends (`messages`, `legacy`) remain unvalidated; legacy receive does not expose reliability.
 
 ## Prepare on Linux
 
@@ -25,12 +27,12 @@ python3 ops/steam-bridge/prepare-linux.py --desktop --load-profile
 
 The AppArmor profile must be loaded again after reboot before starting this container. The setup command preserves existing tokens and Steam data. App state defaults to `~/.local/state/sts2-steam-bridge`, mode 0700; it is outside the checkout. Set `STEAM_BRIDGE_HOME` to choose another private directory. The current Compose image assumes host uid 1000.
 
-Only loopback ports are published:
+By default only loopback ports are published:
 
 - `127.0.0.1:6091`: private Steam desktop, protected by a generated VNC password.
 - `127.0.0.1:6092`: bridge diagnostics and authenticated WebSocket endpoint.
 
-To sign in from another computer, tunnel the desktop:
+For private tailnet desktop access, set `STEAM_BRIDGE_DESKTOP_BIND` to this server's Tailscale IPv4 address before setup. Other non-loopback addresses are refused. Alternatively tunnel the default desktop:
 
 ```sh
 ssh -L 6091:127.0.0.1:6091 <you>@<your-server>
@@ -49,9 +51,15 @@ tools/ios-dotnet/dotnet run --project tools/SteamBridgeInspector -- \
 
 Inspect `SteamClient`, its connection initializer and the packet receive/send methods. Establish the exact Steam API family, virtual port, reliability semantics, game channel framing, initialization callbacks and version/mod/data handshake. Use the matching original game version and no gameplay mods. The server must be signed into the same Steam ID as the launcher.
 
-Only after auditing, pin `STEAM_BRIDGE_STEAM_ID` and select `STEAM_BRIDGE_TRANSPORT` when starting Compose. `connect` refuses a disabled transport and forwarding refuses every peer except the joined lobby's owner. The prototype only joins another host's lobby; it does not host.
+After auditing, pin `STEAM_BRIDGE_STEAM_ID` and select `STEAM_BRIDGE_TRANSPORT=sockets` when starting Compose. The startup script creates a private `bridge-state/steam_appid.txt` and launches the bridge from that directory, alongside the ordinary Steam client. `connect` refuses a disabled transport and forwarding refuses every peer except the joined lobby's owner. The prototype only joins another host's lobby; it does not host.
 
 The production phone client accepts only `wss://<host>/bridge` on port 443, with normal certificate validation. Put the bridge behind your existing TLS proxy or private network before phone testing. It does not connect to the local plaintext diagnostic port. Do not expose the Steam desktop publicly.
+
+## Phone setup
+
+Build the experimental branch with the existing **Build IPA** GitHub Action. Install its unsigned IPA using the same bundle ID and sideloader as your current fork. Enable Tailscale on the iPhone if the server is private, match the host's game version, turn mods off, and open **Steam Bridge** from the game's main menu. Enter `wss://<your-private-server>/bridge` and the token from the server's private `bridge-token` file. Press **Connect to server**, then choose a hosting friend. No credentials or game files belong in the Actions build.
+
+The prototype only joins another player's Steam lobby. Losing the bridge disconnects the game; it does not replay packets or silently reconnect. A successful server connection or native peer connection is not proof that character selection and gameplay work. Complete the live acceptance test before treating it as supported multiplayer.
 
 ## Protocol
 
@@ -59,7 +67,7 @@ Server greeting: `{"type":"hello","protocol":1,"status":{...}}`. Steam IDs and l
 
 Text commands have `id` and `type`: `status`, `friends`, `join` (`lobbyId`), `connect` (`virtualPort`, `channels`) and `disconnect`. Replies have `type=result`, the request `id`, `ok`, and `data` or `error`. Control commands are bounded to 8 KiB and have a 20-second deadline. Native transport opening is distinct from the game's successful handshake.
 
-Binary messages preserve an entire original game packet in one WebSocket message: ASCII `S2B1` (4 bytes), reliability byte (0/1), reserved zero byte, little-endian channel u16, peer Steam ID u64, then the unchanged payload. Payload limit is 64 KiB. Oversize, invalid envelopes, unknown peers, unauthorized channels, slow-reader queue overflow and account changes terminate or refuse the session. Game packets and credentials are not logged.
+Binary messages preserve an entire original game packet in one WebSocket message: ASCII `S2B1` (4 bytes), reliability byte (0/1), reserved zero byte, little-endian channel u16, peer Steam ID u64, then the unchanged payload. Payload limit is 512 KiB, matching the audited Steam send limit. Outgoing queues are bounded to 64 messages. Oversize, invalid envelopes, unknown peers, unauthorized channels, slow-reader queue overflow and account changes terminate or refuse the session. Game packets and credentials are not logged.
 
 ## Validation
 
@@ -68,7 +76,7 @@ tools/ios-dotnet/dotnet test tests/SteamBridge.Tests
 tools/ios-dotnet/dotnet build tools/SteamBridgeInspector
 ```
 
-Live acceptance: friend hosts an unmodified matching desktop game; the iPhone joins through Linux; both select characters, enter combat, play cards, finish a turn and change rooms with no desync. Then verify dropped connections fail clearly and leave no orphaned lobby. This requires a new experimental IPA with the game adapter, a signed-in Steam account and two players; automated protocol tests do not establish that compatibility.
+Live acceptance: friend hosts an unmodified matching desktop game; the iPhone joins through Linux; both select characters, enter combat, play cards, finish a turn and change rooms with no desync. Then verify dropped connections fail clearly and leave no orphaned lobby. This requires the experimental branch IPA, a signed-in Steam account and two players on the exact same game version; automated protocol tests do not establish that compatibility.
 
 ## Dependency provenance
 

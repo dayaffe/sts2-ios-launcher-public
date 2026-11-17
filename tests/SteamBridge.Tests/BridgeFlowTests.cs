@@ -8,6 +8,11 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using STS2Mobile.SteamBridge.Protocol;
+using STS2Mobile.GameHost;
+using MegaCrit.Sts2.Core.Entities.Multiplayer;
+using MegaCrit.Sts2.Core.Multiplayer.Transport;
+using MegaCrit.Sts2.Core.Multiplayer.Game;
+using MegaCrit.Sts2.Core.Platform;
 
 namespace STS2Mobile.SteamBridge.Tests;
 
@@ -145,6 +150,68 @@ public sealed class BridgeFlowTests
         Assert.Empty(fixture.Backend.Sent);
     }
 
+    [Theory]
+    [InlineData(NetTransferMode.Reliable)]
+    [InlineData(NetTransferMode.Unreliable)]
+    public async Task GameAdapterPreservesPacketsAndDeliversOnlyFromGameUpdate(NetTransferMode mode)
+    {
+        await using var fixture = await Fixture.StartAsync();
+        fixture.Backend.ConnectImmediately = true;
+        await using var bridge = await BridgeClient.AttachAsync(await fixture.OpenAsync(), SteamId);
+        var game = new GameHandler();
+        var initializer = new SteamBridgeConnectionInitializer(bridge, 109775240000000001);
+        Assert.Null(await initializer.Connect(game));
+        Assert.Equal(1, game.Connected);
+        Assert.Equal(HostId, initializer.GetHostId());
+        Assert.Equal(SteamId, game.Client!.NetId);
+        Assert.Equal(PlatformType.Steam, game.Platform);
+        var delivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        bridge.PacketReceived += _ => delivered.TrySetResult();
+        byte[] packet = [0, 255, 3, 0, 10];
+        game.Client.SendMessageToHost(packet, 4, mode, 7);
+        await delivered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Empty(game.Packets);
+        game.Client.Update();
+        var received = Assert.Single(game.Packets);
+        Assert.Equal(packet[..4], received.Bytes);
+        Assert.Equal(mode, received.Mode);
+        Assert.Equal(0, received.Channel); // Audited vanilla SteamClient ignores the outgoing channel argument.
+        game.Client.DisconnectFromHost(NetError.Quit);
+        await fixture.Backend.Detached.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.False(game.Client.IsConnected);
+        Assert.Equal(1, game.Disconnected);
+    }
+
+    [Fact]
+    public async Task CancellingGameJoinReleasesSteamSessionWithoutConnecting()
+    {
+        await using var fixture = await Fixture.StartAsync();
+        fixture.Backend.HoldJoin = true;
+        await using var bridge = await BridgeClient.AttachAsync(await fixture.OpenAsync(), SteamId);
+        var game = new GameHandler();
+        using var stop = new CancellationTokenSource();
+        var initializer = new SteamBridgeConnectionInitializer(bridge, 109775240000000001);
+        var joining = initializer.Connect(game, stop.Token);
+        await fixture.Backend.JoinStarted.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        stop.Cancel();
+        Assert.Equal(NetError.CancelledJoin, (await joining)!.Value.Reason);
+        await fixture.Backend.Detached.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Equal(0, game.Connected);
+        Assert.DoesNotContain(fixture.Backend.Commands, c => c.Type == "connect");
+    }
+
+    private sealed class GameHandler : INetClientGameService
+    {
+        public NetClient? Client;
+        public PlatformType Platform;
+        public int Connected, Disconnected;
+        public List<(byte[] Bytes, NetTransferMode Mode, int Channel)> Packets = [];
+        public void Initialize(NetClient client, PlatformType platform) { Client = client; Platform = platform; }
+        public void OnConnectedToHost() => Connected++;
+        public void OnDisconnectedFromHost(ulong peer, NetErrorInfo info) => Disconnected++;
+        public void OnPacketReceived(ulong peer, byte[] bytes, NetTransferMode mode, int channel) => Packets.Add((bytes, mode, channel));
+    }
+
     private static async Task<byte[]> ReadAsync(WebSocket socket)
     {
         byte[] buffer = new byte[8192];
@@ -186,6 +253,9 @@ public sealed class BridgeFlowTests
         public List<BridgeCommand> Commands { get; } = [];
         public TaskCompletionSource Detached { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool HoldFriends { get; set; }
+        public bool HoldJoin { get; set; }
+        public bool ConnectImmediately { get; set; }
+        public TaskCompletionSource JoinStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool NotifyDuringAttach { get; set; }
         public TaskCompletionSource FriendsStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public BridgeStatus Status => new(true, "ready", SteamId.ToString(), "test account", "sockets");
@@ -200,6 +270,9 @@ public sealed class BridgeFlowTests
         public Task<object?> ExecuteAsync(BridgeCommand command, CancellationToken ct)
         {
             Commands.Add(command);
+            if (command.Type == "join" && HoldJoin) { JoinStarted.TrySetResult(); return HoldAsync(ct); }
+            if (command.Type == "connect" && ConnectImmediately)
+                Notify!(new("connection", new { state = "k_ESteamNetworkingConnectionState_Connected" }));
             if (command.Type == "friends" && HoldFriends)
             {
                 FriendsStarted.TrySetResult();

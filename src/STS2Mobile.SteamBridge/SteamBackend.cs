@@ -207,11 +207,12 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
     private object Friends()
     {
         var friends = new List<object>();
-        for (int i = 0; i < SteamFriends.GetFriendCount(EFriendFlags.k_EFriendFlagImmediate); i++)
+        for (int i = 0; i < SteamFriends.GetFriendCount(EFriendFlags.k_EFriendFlagImmediate) && friends.Count < 64; i++)
         {
             CSteamID id = SteamFriends.GetFriendByIndex(i, EFriendFlags.k_EFriendFlagImmediate);
             if (!SteamFriends.GetFriendGamePlayed(id, out FriendGameInfo_t game) || game.m_gameID.AppID().m_AppId != BridgeOptions.AppId) continue;
-            friends.Add(new { steamId = id.m_SteamID.ToString(CultureInfo.InvariantCulture), name = SteamFriends.GetFriendPersonaName(id),
+            string name = SteamFriends.GetFriendPersonaName(id);
+            friends.Add(new { steamId = id.m_SteamID.ToString(CultureInfo.InvariantCulture), name = name[..Math.Min(name.Length, 128)],
                 lobbyId = game.m_steamIDLobby.m_SteamID.ToString(CultureInfo.InvariantCulture) });
         }
         return friends;
@@ -310,17 +311,23 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
             int count = options.Transport == "sockets"
                 ? SteamNetworkingSockets.ReceiveMessagesOnConnection(_socket, messages, messages.Length)
                 : SteamNetworkingMessages.ReceiveMessagesOnChannel(channel, messages, messages.Length);
-            for (int i = 0; i < count; i++)
+            try
             {
-                try
+                for (int i = 0; i < count; i++)
                 {
                     var message = SteamNetworkingMessage_t.FromIntPtr(messages[i]);
-                    if (message.m_identityPeer.GetSteamID64() != _peer || message.m_cbSize is <= 0 or > BridgePacket.MaxPayload) continue;
+                    if (message.m_identityPeer.GetSteamID64() != _peer) continue;
+                    if (message.m_cbSize is <= 0 or > BridgePacket.MaxPayload || !_channels.Contains(message.m_nChannel))
+                        throw new InvalidOperationException("Steam packet exceeds the configured size or channels.");
                     byte[] payload = new byte[message.m_cbSize];
                     Marshal.Copy(message.m_pData, payload, 0, payload.Length);
-                    _packet?.Invoke(new(_peer, channel, (message.m_nFlags & Constants.k_nSteamNetworkingSend_Reliable) != 0, payload));
+                    _packet?.Invoke(new(_peer, message.m_nChannel, (message.m_nFlags & Constants.k_nSteamNetworkingSend_Reliable) != 0, payload));
                 }
-                finally { SteamNetworkingMessage_t.Release(messages[i]); }
+            }
+            finally
+            {
+                // Steam transfers ownership of the whole batch, including entries after a rejected packet.
+                for (int i = 0; i < count; i++) SteamNetworkingMessage_t.Release(messages[i]);
             }
         }
     }

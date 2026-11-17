@@ -15,6 +15,7 @@ if (worker)
 var builder = WebApplication.CreateBuilder(args.Where(a => a != "--worker").ToArray());
 // Do not record URLs/query strings supplied by clients, including rejected credential attempts.
 builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
+builder.Logging.AddSimpleConsole(console => console.TimestampFormat = "HH:mm:ss ");
 // Steam and the bridge share a private container; only the host's loopback port is published by Compose.
 builder.WebHost.UseUrls($"http://{(worker ? "127.0.0.1" : "0.0.0.0")}:{options.Port}");
 builder.Services.AddSingleton(options);

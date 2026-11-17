@@ -22,6 +22,7 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
     private ulong _peer;
     private int[] _channels = [0];
     private HSteamNetConnection _socket;
+    private long _sentPackets, _receivedPackets;
     private Callback<SteamNetConnectionStatusChangedCallback_t>? _socketStatus;
     private Callback<SteamNetworkingMessagesSessionRequest_t>? _messageRequest;
     private Callback<P2PSessionRequest_t>? _legacyRequest;
@@ -130,6 +131,7 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
 
     public Task<object?> ExecuteAsync(BridgeCommand command, CancellationToken cancellationToken)
     {
+        logger.LogInformation("Bridge operation: {Operation}.", command.Type);
         if (command.Type == "status") return Task.FromResult<object?>(Status);
         if (command.Type == "friends") return FriendsAsync(cancellationToken);
         if (command.Type == "join") return JoinAsync(ulong.Parse(command.LobbyId!, CultureInfo.InvariantCulture), cancellationToken);
@@ -168,6 +170,7 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
                 };
             }
         }
+        if (sent && ++_sentPackets == 1) logger.LogInformation("First phone packet forwarded: bytes={Bytes}, reliable={Reliable}, channel={Channel}.", packet.Payload.Length, packet.Reliable, packet.Channel);
         if (!sent) throw new InvalidOperationException("Steam refused the packet; verify the audited transport and channel mapping.");
         return null;
     }, cancellationToken);
@@ -214,9 +217,14 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
                     if (ok) SteamMatchmaking.LeaveLobby(new CSteamID(entered.m_ulSteamIDLobby));
                     answer.TrySetCanceled(new CancellationToken(true));
                 }
-                else if (!ok) answer.TrySetException(new InvalidOperationException("Steam refused the lobby join."));
+                else if (!ok)
+                {
+                    logger.LogWarning("Steam refused the lobby join: ioFailure={IoFailure}, result={Result}.", failed, entered.m_EChatRoomEnterResponse);
+                    answer.TrySetException(new InvalidOperationException("Steam refused the lobby join."));
+                }
                 else
                 {
+                    logger.LogInformation("Steam lobby join succeeded.");
                     _lobby = entered.m_ulSteamIDLobby;
                     ulong owner = SteamMatchmaking.GetLobbyOwner(new CSteamID(_lobby)).m_SteamID;
                     answer.TrySetResult(new { lobbyId = _lobby.ToString(CultureInfo.InvariantCulture), ownerId = owner.ToString(CultureInfo.InvariantCulture) });
@@ -271,6 +279,8 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
             _peer = 0;
             throw new InvalidOperationException("This prototype only joins games hosted by another player.");
         }
+        _sentPackets = _receivedPackets = 0;
+        logger.LogInformation("Opening Steam peer transport: kind={Transport}, virtualPort={Port}.", options.Transport, command.VirtualPort);
         SteamNetworkingUtils.InitRelayNetworkAccess();
         if (options.Transport == "sockets")
         {
@@ -289,6 +299,8 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
     private object? Disconnect()
     {
         Interlocked.Increment(ref _generation);
+        if (_socket != HSteamNetConnection.Invalid)
+            logger.LogInformation("Closing Steam peer transport: sentPackets={Sent}, receivedPackets={Received}.", _sentPackets, _receivedPackets);
         if (_socket != HSteamNetConnection.Invalid)
             SteamNetworkingSockets.CloseConnection(_socket, 0, "Bridge disconnected.", false);
         if (_peer != 0)
@@ -323,6 +335,7 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
         _socketStatus = Callback<SteamNetConnectionStatusChangedCallback_t>.Create(change =>
         {
             if (change.m_hConn != _socket) return;
+            logger.LogInformation("Steam peer state: {State}, endReason={Reason}.", change.m_info.m_eState, change.m_info.m_eEndReason);
             _notify?.Invoke(new("connection", new { state = change.m_info.m_eState.ToString(), reason = change.m_info.m_eEndReason }));
             if (change.m_info.m_eState is ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_ClosedByPeer
                 or ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_ProblemDetectedLocally) Disconnect();
@@ -372,6 +385,7 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
                         throw new InvalidOperationException("Steam packet exceeds the configured size or channels.");
                     byte[] payload = new byte[message.m_cbSize];
                     Marshal.Copy(message.m_pData, payload, 0, payload.Length);
+                    if (++_receivedPackets == 1) logger.LogInformation("First host packet received: bytes={Bytes}, flags={Flags}, channel={Channel}.", payload.Length, message.m_nFlags, message.m_nChannel);
                     _packet?.Invoke(new(_peer, message.m_nChannel, (message.m_nFlags & Constants.k_nSteamNetworkingSend_Reliable) != 0, payload));
                 }
             }

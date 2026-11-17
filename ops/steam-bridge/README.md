@@ -2,7 +2,7 @@
 
 Goal: an iPhone running the game locally joins a friend's **unmodified** Steam game through a Linux machine that owns the Steam networking session. The server does not simulate the game or stream video.
 
-This is a prototype. It is **not included in v1.2.1**. Version **1.2.4** includes the experimental phone adapter and pairing UI; forwarding requires an explicitly configured Linux server. The server, phone-side transport adapter, pairing UI and protocol have automated integration coverage with an in-process test backend; a live vanilla-game handshake has not been verified. Gameplay forwarding defaults to `disabled`. Do not call this working vanilla multiplayer until the acceptance test below passes.
+This is a prototype. It is **not included in v1.2.1**. Version **1.2.5** includes the experimental phone adapter and pairing UI; forwarding requires an explicitly configured Linux server. The server, phone-side transport adapter, pairing UI and protocol have automated integration coverage with an in-process test backend; a live vanilla-game handshake has not been verified. Gameplay forwarding defaults to `disabled`. Do not call this working vanilla multiplayer until the acceptance test below passes.
 
 ## Components
 
@@ -11,7 +11,7 @@ This is a prototype. It is **not included in v1.2.1**. Version **1.2.4** include
 - `tools/SteamBridgeInspector`: reads the owner's desktop `sts2.dll` as metadata, without executing it. Reports the assembly hash, Steam API call sites, channel/port constants and the public/protected transport API. Reports and game inputs stay in ignored local directories.
 - This folder: isolated Steam desktop with browser/VNC access, reproducible dependency downloads, and container-specific namespace settings.
 
-Version 1.2.4 includes a `Steam Bridge` button in the game's main menu for the inspected 0.113 multiplayer interface. Pair it with your own server, then choose a hosting friend or paste a Steam lobby link. The pairing token is stored in the iPhone's device-only Keychain and is bound to the selected endpoint. The UI requires mods to be off. It invokes the game's normal join flow on its cached screen without opening the desktop friend picker, whose automatic fallback would create a competing transport.
+Version 1.2.5 includes a `Steam Bridge` button in the game's main menu for the inspected 0.113 multiplayer interface. Pair it with your own server, then choose a hosting friend or paste a Steam lobby link. The pairing token is stored in the iPhone's device-only Keychain and is bound to the selected endpoint. The UI requires mods to be off. Friend discovery waits for Steam's initial presence synchronization, refreshes without restarting Steam, and listens for new lobby invitations while connected. Invitations are retained for five minutes, including invitations to private lobbies. An invite sent while the server was offline may need to be resent after connecting. It invokes the game's normal join flow on its cached screen without opening the desktop friend picker, whose automatic fallback would create a competing transport.
 
 The owned Linux public-beta v0.113.1 assembly was inspected: its SteamClient uses SteamNetworkingSockets.ConnectP2P on virtual port 0, sends the original packet bytes with flags 0 (unreliable) or 8 (reliable), ignores the outgoing game channel argument, and receives the native message's channel. The bridge and phone adapter implement that mapping with `sockets`. This establishes transport framing, not a successful vanilla handshake. The other diagnostic backends (`messages`, `legacy`) remain unvalidated; legacy receive does not expose reliability.
 
@@ -19,7 +19,7 @@ The owned Linux public-beta v0.113.1 assembly was inspected: its SteamClient use
 
 The permanent HTTP endpoint never initializes Steam's game API. An authenticated phone connection starts the dedicated container's Steam client and a short-lived game worker. The worker owns the native game session; when the phone disconnects, it exits before the controller closes Steam. Stored sign-in credentials remain private on disk, but no Steam client or game worker runs while idle. `/health` reports `ready: false, state: idle` in that state; this is expected.
 
-The iPhone disconnects on backgrounding, loss of focus, leaving the game, or an explicit Disconnect. Closing the pairing panel before joining also disconnects. An abrupt connection loss is detected by 15-second WebSocket pings with a 15-second reply deadline. Resuming requires an explicit connection; gameplay packets are never replayed. While connected, this session still uses the account for Slay the Spire 2.
+The iPhone disconnects on backgrounding, leaving the game, or an explicit Disconnect. Closing the pairing panel keeps the connection while the game remains in the foreground; use Disconnect to end it explicitly. An abrupt connection loss is detected by 15-second WebSocket pings with a 15-second reply deadline. Resuming requires an explicit connection; gameplay packets are never replayed. While connected, this session still uses the account for Slay the Spire 2.
 
 `STEAM_BRIDGE_MANAGE_STEAM=1` is set by the supplied Compose file and is accepted only inside Docker. Outside this dedicated container, the service can end its game worker but does not terminate the user's desktop Steam client.
 
@@ -71,7 +71,7 @@ The production phone client accepts only `wss://<host>/bridge` on port 443, with
 
 ## Phone setup
 
-Install version 1.2.4 from this fork's SideStore/AltStore source, or build this checkout with the existing **Build IPA** GitHub Action. Use the same bundle ID and sideloader as your current fork. Enable Tailscale on the iPhone if the server is private, match the host's game version, turn mods off, and open **Steam Bridge** from the game's main menu. Enter `wss://<your-private-server>/bridge` and the token from the server's private `bridge-token` file. Press **Connect to server**, then choose a hosting friend. No credentials or game files belong in the Actions build.
+Install version 1.2.5 from this fork's SideStore/AltStore source, or build this checkout with the existing **Build IPA** GitHub Action. Use the same bundle ID and sideloader as your current fork. Enable Tailscale on the iPhone if the server is private, match the host's game version, turn mods off, and open **Steam Bridge** from the game's main menu. Enter `wss://<your-private-server>/bridge` and the token from the server's private `bridge-token` file. Press **Connect to server**, then choose a hosting friend. No credentials or game files belong in the Actions build.
 
 The prototype only joins another player's Steam lobby. Losing the bridge disconnects the game; it does not replay packets or silently reconnect. A successful server connection or native peer connection is not proof that character selection and gameplay work. Complete the live acceptance test before treating it as supported multiplayer.
 

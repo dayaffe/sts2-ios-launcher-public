@@ -29,6 +29,9 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
     private BridgeClient? _gameBridge;
     private CancellationTokenSource? _connectionStop;
     private bool _working;
+    private sealed record FriendUpdate(JsonElement Friends);
+    private FriendUpdate? _pendingFriends;
+    private int _serverDisconnected;
     private string _savedEndpoint = "";
     private const string EndpointFile = "user://steam-bridge-endpoint.txt";
 
@@ -67,6 +70,7 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
         _token = Input("Paste your server's pairing token"); _token.Secret = true; column.AddChild(_token);
         column.AddChild(Button("Connect to server", () => _ = ConnectAsync()));
         _status = Label("Connect to find friends hosting a game, or paste a Steam lobby link below.", 24); column.AddChild(_status);
+        column.AddChild(Button("Refresh friends", () => _ = RefreshFriendsAsync()));
         _friends = new VBoxContainer(); column.AddChild(_friends);
         _lobby = Input("Lobby ID or steam://joinlobby/... link"); column.AddChild(_lobby);
         column.AddChild(Button("Join lobby", () =>
@@ -84,17 +88,22 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
     public override void _Process(double delta)
     {
         bool show = _game != null && IsInstanceValid(_game) && _game.MainMenu is { } menu && IsInstanceValid(menu) && menu.IsVisibleInTree();
+        var update = Interlocked.Exchange(ref _pendingFriends, null);
+        if (update != null && _client?.IsConnected == true) RenderFriends(update.Friends);
+        if (Interlocked.Exchange(ref _serverDisconnected, 0) != 0 && _client?.IsConnected != true)
+            _status.Text = "Server connection ended. Connect again to refresh Steam and rejoin.";
         _root.Visible = show;
         if (!show)
         {
             _panel.Visible = false;
-            if (_client != null) { _ = _client.DisposeAsync(); _client = null; }
+            if (_client != null) Disconnect();
         }
     }
 
     private async Task ConnectAsync()
     {
         if (_working) return;
+        if (_client?.IsConnected == true) { await RefreshFriendsAsync(); return; }
         if (_gameBridge?.IsConnected == true) { _status.Text = "Disconnect the current game before opening another server session."; return; }
         _gameBridge = null;
         if (ModLaunchSettings.Enabled) { _status.Text = "Turn mods off in the launcher and restart first."; return; }
@@ -105,30 +114,76 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
         try
         {
             _status.Text = "Starting Steam on your server... This can take up to 90 seconds.";
-            if (_client != null) { await _client.DisposeAsync(); _client = null; }
+            if (_client != null) { DetachMenuCallbacks(_client); await _client.DisposeAsync(); _client = null; }
             if (!Uri.TryCreate(_endpoint.Text.Trim(), UriKind.Absolute, out var endpoint)) throw new ArgumentException("Enter a valid server address.");
             _client = await BridgeClient.ConnectAsync(endpoint, _token.Text.Trim(), RuntimeServices.GetLocalPlayerId(), connecting);
+            _client.EventReceived += OnMenuEvent;
+            _client.Disconnected += OnMenuDisconnected;
+            Interlocked.Exchange(ref _serverDisconnected, 0);
             connecting.ThrowIfCancellationRequested();
             SaveEndpoint(endpoint.AbsoluteUri, _token.Text.Trim());
-            JsonElement friends = await _client.ExecuteAsync("friends", ct: connecting);
-            foreach (Node child in _friends.GetChildren()) { _friends.RemoveChild(child); child.QueueFree(); }
-            int count = 0;
-            foreach (var friend in friends.EnumerateArray())
-            {
-                if (!ulong.TryParse(friend.GetProperty("lobbyId").GetString(), out ulong lobby) || lobby == 0) continue;
-                string name = friend.GetProperty("name").GetString() ?? "Friend";
-                _friends.AddChild(Button("Join " + name, () => _ = JoinAsync(lobby)));
-                count++;
-            }
-            _status.Text = count == 0 ? "Connected. No friends are hosting a lobby yet. Ask a friend to host the same game version, then connect again, or paste their lobby link." : "Connected. Choose a friend to join.";
+            _status.Text = "Connected. Loading Steam friends and invitations...";
+            RenderFriends(await _client.ExecuteAsync("friends", ct: connecting));
         }
         catch (Exception error)
         {
             _status.Text = error is ArgumentException or InvalidOperationException ? error.Message : "Could not connect. Check the server address, pairing token and Tailscale connection.";
             GD.Print("Steam bridge connection: ", error.GetType().Name);
-            if (_client != null) { await _client.DisposeAsync(); _client = null; }
+            if (_client != null) { DetachMenuCallbacks(_client); await _client.DisposeAsync(); _client = null; }
         }
         finally { _working = false; }
+    }
+
+    private async Task RefreshFriendsAsync()
+    {
+        if (_working) return;
+        if (_client?.IsConnected != true) { _status.Text = "Connect to your server first."; return; }
+        _working = true;
+        try
+        {
+            _status.Text = "Refreshing Steam friends and invitations...";
+            RenderFriends(await _client.ExecuteAsync("friends", ct: _stop.Token));
+        }
+        catch (Exception error)
+        {
+            _status.Text = "Could not refresh friends. Check the connection, then try again.";
+            GD.Print("Steam bridge refresh: ", error.GetType().Name);
+        }
+        finally { _working = false; }
+    }
+
+    private void RenderFriends(JsonElement friends)
+    {
+        foreach (Node child in _friends.GetChildren()) { _friends.RemoveChild(child); child.QueueFree(); }
+        int joinable = 0, playing = 0;
+        foreach (var friend in friends.EnumerateArray())
+        {
+            string name = friend.GetProperty("name").GetString() ?? "Friend";
+            playing++;
+            if (!ulong.TryParse(friend.GetProperty("lobbyId").GetString(), out ulong lobby) || lobby == 0)
+            {
+                _friends.AddChild(Label(name + " is playing; waiting for Steam's lobby details.", 24));
+                continue;
+            }
+            bool invited = friend.TryGetProperty("invited", out var invite) && invite.GetBoolean();
+            _friends.AddChild(Button((invited ? "Join invitation from " : "Join ") + name, () => _ = JoinAsync(lobby)));
+            joinable++;
+        }
+        _status.Text = joinable > 0 ? "Connected. Choose a friend or invitation to join." : playing > 0
+            ? "Connected. Steam sees friends playing, but has not provided a joinable lobby yet. Refresh, ask for a new invite, or paste a lobby link."
+            : "Connected. Waiting for Steam to advertise a joinable lobby or deliver an invitation. Refresh, ask your friend to send a new invite while connected, or paste their lobby link.";
+    }
+
+    private void OnMenuEvent(JsonElement message)
+    {
+        if (message.GetProperty("type").GetString() == "friends")
+            Interlocked.Exchange(ref _pendingFriends, new FriendUpdate(message.GetProperty("data").Clone()));
+    }
+    private void OnMenuDisconnected() => Interlocked.Exchange(ref _serverDisconnected, 1);
+    private void DetachMenuCallbacks(BridgeClient bridge)
+    {
+        bridge.EventReceived -= OnMenuEvent;
+        bridge.Disconnected -= OnMenuDisconnected;
     }
 
     private async Task JoinAsync(ulong lobby)
@@ -137,6 +192,7 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
         if (_client?.IsConnected != true) { _status.Text = "Connect to your server first."; return; }
         _working = true;
         var bridge = _client;
+        DetachMenuCallbacks(bridge);
         _gameBridge = bridge;
         _client = null;
         var initializer = new SteamBridgeConnectionInitializer(bridge, lobby);
@@ -216,20 +272,20 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
     private void ClosePanel()
     {
         _panel.Visible = false;
-        if (_gameBridge?.IsConnected != true) Disconnect();
+        // Hiding the panel does not end an authenticated foreground game session.
     }
 
     private void Disconnect()
     {
         _connectionStop?.Cancel();
-        if (_client != null) { _ = _client.DisposeAsync(); _client = null; }
+        if (_client != null) { DetachMenuCallbacks(_client); _ = _client.DisposeAsync(); _client = null; }
         if (_gameBridge != null) { _ = _gameBridge.DisposeAsync(); _gameBridge = null; }
         if (_status != null && IsInstanceValid(_status)) _status.Text = "Disconnected. Steam on your server will close.";
     }
 
     public override void _Notification(int what)
     {
-        if (what == NotificationApplicationPaused || what == NotificationApplicationFocusOut) Disconnect();
+        if (what == NotificationApplicationPaused) Disconnect();
     }
 
     public override void _ExitTree()
@@ -240,7 +296,7 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
 
     private static Button Button(string text, Action action)
     {
-        var button = new Button { Text = text, CustomMinimumSize = new Vector2(0, 64) };
+        var button = new Button { Text = text, ClipText = true, CustomMinimumSize = new Vector2(0, 64) };
         button.AddThemeFontSizeOverride("font_size", 26);
         button.Pressed += action;
         return button;

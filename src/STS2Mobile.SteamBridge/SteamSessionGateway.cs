@@ -15,7 +15,7 @@ public interface ISteamWorkerFactory
 }
 
 /// <summary>The permanent endpoint never initializes Steam. Only its per-phone child process does.</summary>
-public sealed class SteamSessionGateway(ISteamWorkerFactory workers)
+public sealed class SteamSessionGateway(ISteamWorkerFactory workers, ILogger<SteamSessionGateway>? logger = null)
 {
     private int _attached;
     private volatile BridgeStatus _status = new(false, "idle", "0", "", "disabled");
@@ -25,7 +25,8 @@ public sealed class SteamSessionGateway(ISteamWorkerFactory workers)
     {
         if (Interlocked.CompareExchange(ref _attached, 1, 0) != 0)
         {
-            await phone.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Another phone is already attached.", stopped);
+            try { await phone.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Another phone is already attached.", stopped); }
+            catch (WebSocketException) { phone.Abort(); }
             return;
         }
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(stopped);
@@ -37,7 +38,13 @@ public sealed class SteamSessionGateway(ISteamWorkerFactory workers)
             await using var worker = await workers.OpenAsync(startup.Token);
             Task incoming = ForwardAsync(phone, worker.Socket, 8192, false, stop.Token);
             Task outgoing = ForwardAsync(worker.Socket, phone, 65536, true, stop.Token);
-            try { await Task.WhenAny(incoming, outgoing); }
+            try
+            {
+                Task ended = await Task.WhenAny(incoming, outgoing);
+                logger?.LogInformation("Steam session ended from {Side} ({Result}).",
+                    ReferenceEquals(ended, incoming) ? "phone" : "worker",
+                    ended.IsFaulted ? ended.Exception?.GetBaseException().GetType().Name : "closed");
+            }
             finally
             {
                 stop.Cancel();

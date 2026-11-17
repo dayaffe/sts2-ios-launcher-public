@@ -26,6 +26,12 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
     private Callback<SteamNetworkingMessagesSessionRequest_t>? _messageRequest;
     private Callback<P2PSessionRequest_t>? _legacyRequest;
     private readonly List<CallResult<LobbyEnter_t>> _joins = [];
+    private readonly SteamFriendDirectory _friends = new();
+    private readonly Dictionary<ulong, DateTime> _presenceRequests = [];
+    private BridgeFriend[] _publishedFriends = [];
+    private DateTime _nextFriendsUpdate;
+    private Callback<LobbyInvite_t>? _lobbyInvite;
+    private Callback<GameLobbyJoinRequested_t>? _joinRequested;
 
     public BridgeStatus Status => _status;
 
@@ -87,7 +93,20 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
                         id, online ? SteamFriends.GetPersonaName() : "");
                     if (ready)
                     {
-                        try { PollPackets(); }
+                        try
+                        {
+                            PollPackets();
+                            if (DateTime.UtcNow >= _nextFriendsUpdate)
+                            {
+                                _nextFriendsUpdate = DateTime.UtcNow.AddSeconds(2);
+                                var snapshot = FriendsSnapshot();
+                                if (!_publishedFriends.SequenceEqual(snapshot))
+                                {
+                                    _publishedFriends = snapshot;
+                                    _notify?.Invoke(new("friends", snapshot));
+                                }
+                            }
+                        }
                         catch (InvalidOperationException)
                         {
                             _notify?.Invoke(new("transport_error", new { reason = "Native receive failed or exceeded the bridge limit." }));
@@ -112,13 +131,13 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
     public Task<object?> ExecuteAsync(BridgeCommand command, CancellationToken cancellationToken)
     {
         if (command.Type == "status") return Task.FromResult<object?>(Status);
+        if (command.Type == "friends") return FriendsAsync(cancellationToken);
         if (command.Type == "join") return JoinAsync(ulong.Parse(command.LobbyId!, CultureInfo.InvariantCulture), cancellationToken);
         return InvokeAsync<object?>(() =>
         {
             RequireReady();
             return command.Type switch
             {
-                "friends" => Friends(),
                 "connect" => Connect(command),
                 "disconnect" => Disconnect(),
                 _ => throw new InvalidOperationException("Unsupported operation."),
@@ -210,18 +229,33 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
         return await answer.Task.WaitAsync(ct);
     }
 
-    private object Friends()
+    private async Task<object?> FriendsAsync(CancellationToken ct) =>
+        await FriendDiscovery.WaitForLobbiesAsync(token => InvokeAsync(() =>
+        {
+            RequireReady();
+            return FriendsSnapshot(requestPresence: true);
+        }, token), TimeSpan.FromSeconds(8), ct);
+
+    private BridgeFriend[] FriendsSnapshot(bool requestPresence = false)
     {
-        var friends = new List<object>();
-        for (int i = 0; i < SteamFriends.GetFriendCount(EFriendFlags.k_EFriendFlagImmediate) && friends.Count < 64; i++)
+        var presence = new List<FriendPresence>();
+        int count = Math.Min(SteamFriends.GetFriendCount(EFriendFlags.k_EFriendFlagImmediate), 512);
+        for (int i = 0; i < count; i++)
         {
             CSteamID id = SteamFriends.GetFriendByIndex(i, EFriendFlags.k_EFriendFlagImmediate);
-            if (!SteamFriends.GetFriendGamePlayed(id, out FriendGameInfo_t game) || game.m_gameID.AppID().m_AppId != BridgeOptions.AppId) continue;
-            string name = SteamFriends.GetFriendPersonaName(id);
-            friends.Add(new { steamId = id.m_SteamID.ToString(CultureInfo.InvariantCulture), name = name[..Math.Min(name.Length, 128)],
-                lobbyId = game.m_steamIDLobby.m_SteamID.ToString(CultureInfo.InvariantCulture) });
+            bool playing = SteamFriends.GetFriendGamePlayed(id, out FriendGameInfo_t game)
+                && game.m_gameID.AppID().m_AppId == BridgeOptions.AppId;
+            if (requestPresence && (!_presenceRequests.TryGetValue(id.m_SteamID, out DateTime requested)
+                || DateTime.UtcNow - requested >= TimeSpan.FromSeconds(30)))
+            {
+                SteamFriends.RequestUserInformation(id, true);
+                SteamFriends.RequestFriendRichPresence(id);
+                _presenceRequests[id.m_SteamID] = DateTime.UtcNow;
+            }
+            presence.Add(new(id.m_SteamID, SteamFriends.GetFriendPersonaName(id), playing,
+                playing ? game.m_steamIDLobby.m_SteamID : 0));
         }
-        return friends;
+        return _friends.Snapshot(presence, DateTime.UtcNow);
     }
 
     private object Connect(BridgeCommand command)
@@ -275,6 +309,17 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
 
     private void InstallCallbacks()
     {
+        _lobbyInvite = Callback<LobbyInvite_t>.Create(invite =>
+        {
+            if (new CGameID(invite.m_ulGameID).AppID().m_AppId != BridgeOptions.AppId) return;
+            _friends.Invite(invite.m_ulSteamIDUser, invite.m_ulSteamIDLobby, DateTime.UtcNow);
+            _nextFriendsUpdate = DateTime.MinValue;
+        });
+        _joinRequested = Callback<GameLobbyJoinRequested_t>.Create(invite =>
+        {
+            _friends.Invite(invite.m_steamIDFriend.m_SteamID, invite.m_steamIDLobby.m_SteamID, DateTime.UtcNow);
+            _nextFriendsUpdate = DateTime.MinValue;
+        });
         _socketStatus = Callback<SteamNetConnectionStatusChangedCallback_t>.Create(change =>
         {
             if (change.m_hConn != _socket) return;
@@ -345,6 +390,8 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
             Disconnect();
             foreach (var join in _joins) join.Cancel();
             _joins.Clear();
+            _lobbyInvite?.Dispose(); _lobbyInvite = null;
+            _joinRequested?.Dispose(); _joinRequested = null;
             _socketStatus?.Dispose(); _socketStatus = null;
             _messageRequest?.Dispose(); _messageRequest = null;
             _legacyRequest?.Dispose(); _legacyRequest = null;

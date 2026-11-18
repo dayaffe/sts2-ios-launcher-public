@@ -27,6 +27,7 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
     private VBoxContainer _friends = null!;
     private BridgeClient? _client;
     private BridgeClient? _gameBridge;
+    private SteamBridgeConnectionInitializer? _gameJoin;
     private CancellationTokenSource? _connectionStop;
     private bool _working;
     private sealed record FriendUpdate(JsonElement Friends);
@@ -98,6 +99,8 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
             _panel.Visible = false;
             if (_client != null) Disconnect();
         }
+        else if (!_working && _gameJoin is { InUse: false } finished && finished.Released.IsCompleted)
+            ReclaimServerSession(finished.FailureMessage ?? "Back from the game.");
     }
 
     private async Task ConnectAsync()
@@ -106,6 +109,7 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
         if (_client?.IsConnected == true) { await RefreshFriendsAsync(); return; }
         if (_gameBridge?.IsConnected == true) { _status.Text = "Disconnect the current game before opening another server session."; return; }
         _gameBridge = null;
+        _gameJoin = null;
         if (ModLaunchSettings.Enabled) { _status.Text = "Turn mods off in the launcher and restart first."; return; }
         _working = true;
         _connectionStop?.Dispose();
@@ -196,6 +200,7 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
         _gameBridge = bridge;
         _client = null;
         var initializer = new SteamBridgeConnectionInitializer(bridge, lobby);
+        _gameJoin = initializer;
         try
         {
             _panel.Visible = false;
@@ -219,7 +224,32 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
                 _status.Text = initializer.FailureMessage;
                 _panel.Visible = true;
             }
+            if (!initializer.InUse && ReferenceEquals(_gameJoin, initializer)) ReclaimServerSession(_status.Text ?? "");
             _working = false;
+        }
+    }
+
+    // A failed join or a finished game hands the server's Steam session back to this menu, so the next join starts at
+    // once instead of waiting for Steam to start again.
+    private void ReclaimServerSession(string outcome)
+    {
+        var bridge = _gameBridge;
+        var join = _gameJoin;
+        _gameBridge = null;
+        _gameJoin = null;
+        if (bridge == null) return;
+        if (join?.KeptServerSession == true && _client == null)
+        {
+            _client = bridge;
+            bridge.EventReceived += OnMenuEvent;
+            bridge.Disconnected += OnMenuDisconnected;
+            Interlocked.Exchange(ref _serverDisconnected, 0);
+            _status.Text = outcome + " Steam is still running on your server; choose a friend to join again.";
+        }
+        else
+        {
+            _ = bridge.DisposeAsync();
+            _status.Text = outcome + " The server session ended; connect again to rejoin.";
         }
     }
 
@@ -290,6 +320,7 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
         _connectionStop?.Cancel();
         if (_client != null) { DetachMenuCallbacks(_client); _ = _client.DisposeAsync(); _client = null; }
         if (_gameBridge != null) { _ = _gameBridge.DisposeAsync(); _gameBridge = null; }
+        _gameJoin = null;
         if (_status != null && IsInstanceValid(_status)) _status.Text = "Disconnected. Steam on your server will close.";
     }
 

@@ -8,7 +8,8 @@ public static class BridgeHttp
     public static void Map(WebApplication app, string secret)
     {
         var backend = app.Services.GetRequiredService<IBridgeBackend>();
-        Map(app, secret, () => backend.Status, (socket, ct) => BridgeSession.RunAsync(socket, backend, ct));
+        var logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger(typeof(BridgeSession));
+        Map(app, secret, () => backend.Status, (socket, ct) => BridgeSession.RunAsync(socket, backend, ct, logger));
     }
 
     public static void Map(WebApplication app, string secret, Func<BridgeStatus> status,

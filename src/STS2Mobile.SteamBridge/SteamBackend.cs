@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Globalization;
 using System.Runtime.InteropServices;
+using System.Threading.Channels;
 using Steamworks;
 using STS2Mobile.SteamBridge.Protocol;
 
@@ -10,6 +11,12 @@ namespace STS2Mobile.SteamBridge;
 public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> logger, SteamDesktop desktop, IHostApplicationLifetime lifetime) : BackgroundService, IBridgeBackend
 {
     private readonly BlockingCollection<Action> _commands = new(128);
+    // Phone packets bypass the command queue: queueing one costs a channel write, not a round trip to the Steam thread.
+    private readonly Channel<BridgePacket> _sends = Channel.CreateBounded<BridgePacket>(new BoundedChannelOptions(1024) { SingleReader = true });
+    private readonly AutoResetEvent _wake = new(false);
+    private readonly nint[] _received = new nint[64];
+    private readonly OfflineGrace _offline = new(OfflineGrace.Default);
+    private bool _holdingOffline;
     private volatile BridgeStatus _status = new(false, "idle", "0", "", options.Transport);
     private Action<BridgeEvent>? _notify;
     private Action<BridgePacket>? _packet;
@@ -22,7 +29,7 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
     private ulong _peer;
     private int[] _channels = [0];
     private HSteamNetConnection _socket;
-    private long _sentPackets, _receivedPackets;
+    private long _sentPackets, _receivedPackets, _droppedPackets;
     private Callback<SteamNetConnectionStatusChangedCallback_t>? _socketStatus;
     private Callback<SteamNetworkingMessagesSessionRequest_t>? _messageRequest;
     private Callback<P2PSessionRequest_t>? _legacyRequest;
@@ -43,22 +50,25 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
         _packet = packet;
         Interlocked.Increment(ref _generation);
         Volatile.Write(ref _steamRequested, 1);
+        _wake.Set();
         return true;
     }
 
     protected override Task ExecuteAsync(CancellationToken stoppingToken) => Task.Factory.StartNew(() =>
     {
         DateTime nextAttempt = DateTime.MinValue;
+        WaitHandle[] wakeups = [_wake, stoppingToken.WaitHandle];
         try
         {
             while (!stoppingToken.IsCancellationRequested)
             {
                 for (int i = 0; i < 32 && _commands.TryTake(out var command); i++) command();
+                for (int i = 0; i < 256 && _sends.Reader.TryRead(out var packet); i++) Send(packet);
                 if (Volatile.Read(ref _steamRequested) == 0)
                 {
                     if (_initialized) ShutdownSteam();
                     SetStatus(false, "idle");
-                    stoppingToken.WaitHandle.WaitOne(20);
+                    WaitHandle.WaitAny(wakeups, 20);
                     continue;
                 }
                 if (!_initialized && DateTime.UtcNow >= nextAttempt)
@@ -82,41 +92,9 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
                         logger.LogWarning("Steam initialization unavailable ({Kind}).", error.GetType().Name);
                     }
                 }
-                if (_initialized)
-                {
-                    SteamAPI.RunCallbacks();
-                    bool online = SteamUser.BLoggedOn();
-                    ulong id = online ? SteamUser.GetSteamID().m_SteamID : 0;
-                    bool identityMatches = options.ExpectedSteamId == 0 || id == options.ExpectedSteamId;
-                    bool owns = online && SteamApps.BIsSubscribedApp(new AppId_t(BridgeOptions.AppId));
-                    bool ready = online && identityMatches && owns;
-                    SetStatus(ready, !online ? "waiting_for_login" : !identityMatches ? "account_mismatch" : !owns ? "game_not_owned" : "ready",
-                        id, online ? SteamFriends.GetPersonaName() : "");
-                    if (ready)
-                    {
-                        try
-                        {
-                            PollPackets();
-                            if (DateTime.UtcNow >= _nextFriendsUpdate)
-                            {
-                                _nextFriendsUpdate = DateTime.UtcNow.AddSeconds(2);
-                                var snapshot = FriendsSnapshot();
-                                if (!_publishedFriends.SequenceEqual(snapshot))
-                                {
-                                    _publishedFriends = snapshot;
-                                    _notify?.Invoke(new("friends", snapshot));
-                                }
-                            }
-                        }
-                        catch (InvalidOperationException)
-                        {
-                            _notify?.Invoke(new("transport_error", new { reason = "Native receive failed or exceeded the bridge limit." }));
-                            Disconnect();
-                        }
-                    }
-                    else if (_peer != 0 || _lobby != 0) Disconnect();
-                }
-                stoppingToken.WaitHandle.WaitOne(5);
+                if (_initialized) Tick();
+                // Commands and phone packets wake this thread at once; an open peer connection is polled more often.
+                WaitHandle.WaitAny(wakeups, _peer != 0 ? 1 : 5);
             }
         }
         finally
@@ -125,9 +103,62 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
             _initialized = false;
             SetStatus(false, "stopping");
             _commands.CompleteAdding();
+            _sends.Writer.TryComplete();
             while (_commands.TryTake(out var remaining)) remaining();
         }
     }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+    private void Tick()
+    {
+        SteamAPI.RunCallbacks();
+        bool online = SteamUser.BLoggedOn();
+        bool holding = _offline.Holds(online, _status.Ready, DateTime.UtcNow);
+        if (holding != _holdingOffline)
+        {
+            _holdingOffline = holding;
+            if (holding) logger.LogWarning("Steam lost its server connection; keeping the session for up to {Seconds} seconds.", _offline.Limit.TotalSeconds);
+            else if (online) logger.LogInformation("Steam reconnected to its servers within the grace period.");
+            else logger.LogWarning("Steam stayed offline past the grace period; ending the session.");
+        }
+        if (holding)
+        {
+            Service();
+            return;
+        }
+        ulong id = online ? SteamUser.GetSteamID().m_SteamID : 0;
+        bool identityMatches = options.ExpectedSteamId == 0 || id == options.ExpectedSteamId;
+        bool owns = online && SteamApps.BIsSubscribedApp(new AppId_t(BridgeOptions.AppId));
+        bool ready = online && identityMatches && owns;
+        SetStatus(ready, !online ? "waiting_for_login" : !identityMatches ? "account_mismatch" : !owns ? "game_not_owned" : "ready",
+            id, online ? SteamFriends.GetPersonaName() : "");
+        if (ready) Service();
+        else if (_peer != 0 || _lobby != 0) Disconnect();
+    }
+
+    private void Service()
+    {
+        try
+        {
+            PollPackets();
+            // Friend presence only feeds the phone's join menu; a connected game has no use for it.
+            if (_peer == 0 && DateTime.UtcNow >= _nextFriendsUpdate)
+            {
+                _nextFriendsUpdate = DateTime.UtcNow.AddSeconds(2);
+                var snapshot = FriendsSnapshot();
+                if (!_publishedFriends.SequenceEqual(snapshot))
+                {
+                    _publishedFriends = snapshot;
+                    _notify?.Invoke(new("friends", snapshot));
+                }
+            }
+        }
+        catch (Exception error) when (error is InvalidOperationException or ArgumentException)
+        {
+            logger.LogWarning("Closing the Steam peer transport: {Reason}", error.Message);
+            _notify?.Invoke(new("transport_error", new { reason = "Native receive failed or exceeded the bridge limit." }));
+            Disconnect();
+        }
+    }
 
     public Task<object?> ExecuteAsync(BridgeCommand command, CancellationToken cancellationToken)
     {
@@ -147,33 +178,50 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
         }, cancellationToken);
     }
 
-    public Task SendAsync(BridgePacket packet, CancellationToken cancellationToken) => InvokeAsync<object?>(() =>
+    /// <summary>Completes once the packet is queued; the Steam thread sends queued packets in arrival order.</summary>
+    public async Task SendAsync(BridgePacket packet, CancellationToken cancellationToken)
     {
-        RequireReady();
+        await _sends.Writer.WriteAsync(packet, cancellationToken);
+        _wake.Set();
+    }
+
+    private void Send(BridgePacket packet)
+    {
+        // Packets for any other peer or channel never reach Steam. Like the game's own SteamClient, a packet that Steam
+        // refuses is dropped rather than ending the session.
         if (_peer == 0 || packet.PeerId != _peer || !_channels.Contains(packet.Channel))
-            throw new InvalidOperationException("Packets may only reach the joined lobby's host on configured channels.");
-        bool sent;
+        {
+            Drop("no open connection to that host and channel");
+            return;
+        }
+        string? failure;
         unsafe
         {
             fixed (byte* pointer = packet.Payload)
             {
                 var identity = Identity(_peer);
                 int flags = packet.Reliable ? Constants.k_nSteamNetworkingSend_Reliable : Constants.k_nSteamNetworkingSend_Unreliable;
-                sent = options.Transport switch
+                failure = options.Transport switch
                 {
                     "legacy" => SteamNetworking.SendP2PPacket(new CSteamID(_peer), packet.Payload, (uint)packet.Payload.Length,
-                        packet.Reliable ? EP2PSend.k_EP2PSendReliable : EP2PSend.k_EP2PSendUnreliable, packet.Channel),
-                    "messages" => SteamNetworkingMessages.SendMessageToUser(ref identity, (nint)pointer, (uint)packet.Payload.Length, flags, packet.Channel) == EResult.k_EResultOK,
-                    "sockets" when packet.Channel == 0 => SteamNetworkingSockets.SendMessageToConnection(_socket, (nint)pointer,
-                        (uint)packet.Payload.Length, flags, out _) == EResult.k_EResultOK,
-                    _ => false,
+                        packet.Reliable ? EP2PSend.k_EP2PSendReliable : EP2PSend.k_EP2PSendUnreliable, packet.Channel) ? null : "SendP2PPacket failed",
+                    "messages" => Failure(SteamNetworkingMessages.SendMessageToUser(ref identity, (nint)pointer, (uint)packet.Payload.Length, flags, packet.Channel)),
+                    "sockets" => Failure(SteamNetworkingSockets.SendMessageToConnection(_socket, (nint)pointer, (uint)packet.Payload.Length, flags, out _)),
+                    _ => "transport disabled",
                 };
             }
         }
-        if (sent && ++_sentPackets == 1) logger.LogInformation("First phone packet forwarded: bytes={Bytes}, reliable={Reliable}, channel={Channel}.", packet.Payload.Length, packet.Reliable, packet.Channel);
-        if (!sent) throw new InvalidOperationException("Steam refused the packet; verify the audited transport and channel mapping.");
-        return null;
-    }, cancellationToken);
+        if (failure != null) Drop("Steam refused it: " + failure);
+        else if (++_sentPackets == 1) logger.LogInformation("First phone packet forwarded: bytes={Bytes}, reliable={Reliable}, channel={Channel}.", packet.Payload.Length, packet.Reliable, packet.Channel);
+
+        static string? Failure(EResult result) => result == EResult.k_EResultOK ? null : result.ToString();
+    }
+
+    private void Drop(string reason)
+    {
+        // The first drop and every hundredth after it are logged, so a flood of refusals cannot fill the log.
+        if (++_droppedPackets % 100 == 1) logger.LogWarning("Dropped phone packet {Count}: {Reason}.", _droppedPackets, reason);
+    }
 
     public async Task DetachAsync()
     {
@@ -184,6 +232,7 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
                 Interlocked.Increment(ref _generation);
                 Volatile.Write(ref _steamRequested, 0);
                 ShutdownSteam();
+                while (_sends.Reader.TryRead(out _)) { }
                 SetStatus(false, "idle");
                 return null;
             }, CancellationToken.None);
@@ -219,8 +268,9 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
                 }
                 else if (!ok)
                 {
-                    logger.LogWarning("Steam refused the lobby join: ioFailure={IoFailure}, result={Result}.", failed, entered.m_EChatRoomEnterResponse);
-                    answer.TrySetException(new InvalidOperationException("Steam refused the lobby join."));
+                    string reason = LobbyRefusal.Describe(failed, entered.m_EChatRoomEnterResponse);
+                    logger.LogWarning("Steam refused the lobby join: ioFailure={IoFailure}, result={Result} ({Reason}).", failed, entered.m_EChatRoomEnterResponse, reason);
+                    answer.TrySetException(new InvalidOperationException("Steam refused the lobby join: " + reason + "."));
                 }
                 else
                 {
@@ -279,7 +329,7 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
             _peer = 0;
             throw new InvalidOperationException("This prototype only joins games hosted by another player.");
         }
-        _sentPackets = _receivedPackets = 0;
+        _sentPackets = _receivedPackets = _droppedPackets = 0;
         logger.LogInformation("Opening Steam peer transport: kind={Transport}, virtualPort={Port}.", options.Transport, command.VirtualPort);
         SteamNetworkingUtils.InitRelayNetworkAccess();
         if (options.Transport == "sockets")
@@ -300,7 +350,8 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
     {
         Interlocked.Increment(ref _generation);
         if (_socket != HSteamNetConnection.Invalid)
-            logger.LogInformation("Closing Steam peer transport: sentPackets={Sent}, receivedPackets={Received}.", _sentPackets, _receivedPackets);
+            logger.LogInformation("Closing Steam peer transport: sentPackets={Sent}, receivedPackets={Received}, droppedPackets={Dropped}.",
+                _sentPackets, _receivedPackets, _droppedPackets);
         if (_socket != HSteamNetConnection.Invalid)
             SteamNetworkingSockets.CloseConnection(_socket, 0, "Bridge disconnected.", false);
         if (_peer != 0)
@@ -335,8 +386,10 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
         _socketStatus = Callback<SteamNetConnectionStatusChangedCallback_t>.Create(change =>
         {
             if (change.m_hConn != _socket) return;
-            logger.LogInformation("Steam peer state: {State}, endReason={Reason}.", change.m_info.m_eState, change.m_info.m_eEndReason);
-            _notify?.Invoke(new("connection", new { state = change.m_info.m_eState.ToString(), reason = change.m_info.m_eEndReason }));
+            // The host's game explains its closes here, for example "Player is not in the lobby!".
+            string detail = change.m_info.m_szEndDebug;
+            logger.LogInformation("Steam peer state: {State}, endReason={Reason}, detail={Detail}.", change.m_info.m_eState, change.m_info.m_eEndReason, detail);
+            _notify?.Invoke(new("connection", new { state = change.m_info.m_eState.ToString(), reason = change.m_info.m_eEndReason, detail }));
             if (change.m_info.m_eState is ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_ClosedByPeer
                 or ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_ProblemDetectedLocally) Disconnect();
         });
@@ -369,30 +422,30 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
                 }
             return;
         }
-        nint[] messages = new nint[32];
         foreach (int channel in options.Transport == "sockets" ? [0] : _channels)
         {
             int count = options.Transport == "sockets"
-                ? SteamNetworkingSockets.ReceiveMessagesOnConnection(_socket, messages, messages.Length)
-                : SteamNetworkingMessages.ReceiveMessagesOnChannel(channel, messages, messages.Length);
+                ? SteamNetworkingSockets.ReceiveMessagesOnConnection(_socket, _received, _received.Length)
+                : SteamNetworkingMessages.ReceiveMessagesOnChannel(channel, _received, _received.Length);
             try
             {
                 for (int i = 0; i < count; i++)
                 {
-                    var message = SteamNetworkingMessage_t.FromIntPtr(messages[i]);
+                    var message = SteamNetworkingMessage_t.FromIntPtr(_received[i]);
                     if (message.m_identityPeer.GetSteamID64() != _peer) continue;
-                    if (message.m_cbSize is <= 0 or > BridgePacket.MaxPayload || !_channels.Contains(message.m_nChannel))
-                        throw new InvalidOperationException("Steam packet exceeds the configured size or channels.");
+                    if (message.m_cbSize is <= 0 or > BridgePacket.MaxPayload
+                        || NativeChannels.ForBridge(options.Transport, message.m_nChannel, _channels) is not int packetChannel)
+                        throw new InvalidOperationException($"Steam packet refused: bytes={message.m_cbSize}, channel={message.m_nChannel}.");
                     byte[] payload = new byte[message.m_cbSize];
                     Marshal.Copy(message.m_pData, payload, 0, payload.Length);
                     if (++_receivedPackets == 1) logger.LogInformation("First host packet received: bytes={Bytes}, flags={Flags}, channel={Channel}.", payload.Length, message.m_nFlags, message.m_nChannel);
-                    _packet?.Invoke(new(_peer, message.m_nChannel, (message.m_nFlags & Constants.k_nSteamNetworkingSend_Reliable) != 0, payload));
+                    _packet?.Invoke(new(_peer, packetChannel, (message.m_nFlags & Constants.k_nSteamNetworkingSend_Reliable) != 0, payload));
                 }
             }
             finally
             {
                 // Steam transfers ownership of the whole batch, including entries after a rejected packet.
-                for (int i = 0; i < count; i++) SteamNetworkingMessage_t.Release(messages[i]);
+                for (int i = 0; i < count; i++) SteamNetworkingMessage_t.Release(_received[i]);
             }
         }
     }
@@ -411,6 +464,7 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
             _legacyRequest?.Dispose(); _legacyRequest = null;
             SteamAPI.Shutdown();
             _initialized = false;
+            _holdingOffline = false;
         }
         desktop.Stop();
     }
@@ -430,6 +484,7 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
                 if (ct.IsCancellationRequested) { completion.TrySetCanceled(ct); return; }
                 try { completion.TrySetResult(action()); } catch (Exception error) { completion.TrySetException(error); }
             })) completion.TrySetException(new InvalidOperationException("Steam command queue is unavailable."));
+            else _wake.Set();
         }
         catch (InvalidOperationException) { completion.TrySetException(new InvalidOperationException("Steam is stopping.")); }
         return completion.Task.WaitAsync(ct);

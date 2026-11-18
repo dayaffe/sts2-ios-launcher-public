@@ -150,6 +150,20 @@ public sealed class BridgeFlowTests
         Assert.Empty(fixture.Backend.Sent);
     }
 
+    [Fact]
+    public async Task HostBurstOfManySmallPacketsReachesASlowPhoneInOrder()
+    {
+        await using var fixture = await Fixture.StartAsync();
+        using WebSocket socket = await fixture.OpenAsync();
+        await ReadAsync(socket); // hello
+        // A host sends many small messages at once around run start; the session holds them for a phone reading later.
+        for (int i = 0; i < 500; i++) fixture.Backend.Packet!(new BridgePacket(HostId, 0, true, BitConverter.GetBytes(i)));
+        for (int i = 0; i < 500; i++)
+            Assert.Equal(i, BitConverter.ToInt32(BridgePacket.Decode(await ReadAsync(socket)).Payload));
+        Assert.False(fixture.Backend.Detached.Task.IsCompleted);
+        socket.Abort();
+    }
+
     [Theory]
     [InlineData(NetTransferMode.Reliable)]
     [InlineData(NetTransferMode.Unreliable)]
@@ -177,9 +191,58 @@ public sealed class BridgeFlowTests
         Assert.Equal(mode, received.Mode);
         Assert.Equal(0, received.Channel); // Audited vanilla SteamClient ignores the outgoing channel argument.
         game.Client.DisconnectFromHost(NetError.Quit);
-        await fixture.Backend.Detached.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        await AssertServerSessionKeptAsync(fixture, bridge, initializer);
         Assert.False(game.Client.IsConnected);
         Assert.Equal(1, game.Disconnected);
+    }
+
+    [Fact]
+    public async Task GameAdapterHoldsAHostBurstWhileTheGameIsNotReading()
+    {
+        await using var fixture = await Fixture.StartAsync();
+        fixture.Backend.ConnectImmediately = true;
+        await using var bridge = await BridgeClient.AttachAsync(await fixture.OpenAsync(), SteamId);
+        var game = new GameHandler();
+        var initializer = new SteamBridgeConnectionInitializer(bridge, 109775240000000001);
+        Assert.Null(await initializer.Connect(game));
+        int arrived = 0;
+        bridge.PacketReceived += _ => Interlocked.Increment(ref arrived);
+        // The game stops calling Update while it loads a scene; the host keeps sending meanwhile.
+        for (int i = 0; i < 500; i++) fixture.Backend.Packet!(new BridgePacket(HostId, 0, true, BitConverter.GetBytes(i)));
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        while (Volatile.Read(ref arrived) < 500) await Task.Delay(5, deadline.Token);
+        game.Client!.Update();
+        Assert.True(game.Client.IsConnected);
+        Assert.Equal(500, game.Packets.Count);
+        Assert.Equal(499, BitConverter.ToInt32(game.Packets[^1].Bytes));
+        Assert.Equal(0, game.Disconnected);
+    }
+
+    [Fact]
+    public async Task HostCloseReasonReachesTheJoinFailureAndKeepsTheServerSession()
+    {
+        await using var fixture = await Fixture.StartAsync();
+        await using var bridge = await BridgeClient.AttachAsync(await fixture.OpenAsync(), SteamId);
+        var game = new GameHandler();
+        var initializer = new SteamBridgeConnectionInitializer(bridge, 109775240000000001);
+        Task<NetErrorInfo?> connecting = initializer.Connect(game);
+        await fixture.Backend.ConnectStarted.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        fixture.Backend.Notify!(new("connection", new { state = "k_ESteamNetworkingConnectionState_ClosedByPeer", reason = 4001, detail = "Player is not in the lobby!" }));
+        Assert.Equal(NetError.UnknownNetworkError, (await connecting.WaitAsync(TimeSpan.FromSeconds(3)))!.Value.Reason);
+        Assert.Contains("waiting for Steam to connect", initializer.FailureMessage);
+        Assert.Contains("The host closed the Steam connection: Player is not in the lobby!", initializer.FailureMessage);
+        await AssertServerSessionKeptAsync(fixture, bridge, initializer);
+        await bridge.ExecuteAsync("friends");
+    }
+
+    private static async Task AssertServerSessionKeptAsync(Fixture fixture, BridgeClient bridge, SteamBridgeConnectionInitializer initializer)
+    {
+        // The server leaves the lobby and closes the peer, but keeps Steam running for the next join.
+        await initializer.ReleaseIfUnusedAsync().WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.True(initializer.KeptServerSession);
+        Assert.True(bridge.IsConnected);
+        Assert.Contains(fixture.Backend.Commands, command => command.Type == "disconnect");
+        Assert.False(fixture.Backend.Detached.Task.IsCompleted);
     }
 
     [Fact]
@@ -195,7 +258,9 @@ public sealed class BridgeFlowTests
         await fixture.Backend.JoinStarted.Task.WaitAsync(TimeSpan.FromSeconds(3));
         stop.Cancel();
         Assert.Equal(NetError.CancelledJoin, (await joining)!.Value.Reason);
+        // The server never answered the join, so it may still enter the lobby; ending the session cancels it there.
         await fixture.Backend.Detached.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.False(initializer.KeptServerSession);
         Assert.Equal(0, game.Connected);
         Assert.DoesNotContain(fixture.Backend.Commands, c => c.Type == "connect");
     }
@@ -316,7 +381,7 @@ public sealed class BridgeFlowTests
         Assert.Null(await connecting.WaitAsync(TimeSpan.FromSeconds(3)));
         Assert.Equal(1, game.Connected);
         game.Client!.DisconnectFromHost(NetError.Quit);
-        await fixture.Backend.Detached.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        await AssertServerSessionKeptAsync(fixture, bridge, initializer);
     }
 
     [Fact]
@@ -351,7 +416,7 @@ public sealed class BridgeFlowTests
         Assert.Contains("NotSupportedException: Handshake callback unavailable.", initializer.FailureMessage);
         Assert.Contains(nameof(GameHandler.OnConnectedToHost), initializer.FailureDetail);
         Assert.False(game.Client!.IsConnected);
-        await fixture.Backend.Detached.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        await AssertServerSessionKeptAsync(fixture, bridge, initializer);
     }
 
     private sealed class GameHandler : INetClientGameService
@@ -410,6 +475,7 @@ public sealed class BridgeFlowTests
         private int _attached;
         private Action<BridgePacket>? _packet;
         public Action<BridgeEvent>? Notify { get; private set; }
+        public Action<BridgePacket>? Packet => _packet;
         public List<BridgePacket> Sent { get; } = [];
         public List<BridgeCommand> Commands { get; } = [];
         public TaskCompletionSource Attached { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);

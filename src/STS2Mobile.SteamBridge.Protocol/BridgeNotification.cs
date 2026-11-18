@@ -6,6 +6,11 @@ namespace STS2Mobile.SteamBridge.Protocol;
 public sealed class BridgeNotification(JsonElement message)
 {
     public JsonElement GetProperty(string name) => message.GetProperty(name);
+
+    /// <summary>A string field of the notification's data, or null; keeps optional-field lookups in compiled code.</summary>
+    public string? GetDataString(string name) =>
+        message.TryGetProperty("data", out JsonElement data) && data.ValueKind == JsonValueKind.Object
+        && data.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 }
 
 /// <summary>Keep generic task/timer machinery in the AOT transport assembly.</summary>

@@ -8,20 +8,25 @@ namespace STS2Mobile.SteamBridge;
 
 public static class BridgeSession
 {
+    // What the server may hold for a phone that reads slowly, for example during a host's burst at run start.
+    // The limit is in bytes because a burst of many small game messages is normal and harmless.
+    public const long MaxQueuedBytes = 8 * 1024 * 1024;
     private sealed record Outgoing(byte[] Bytes, WebSocketMessageType Type);
 
-    public static async Task RunAsync(WebSocket socket, IBridgeBackend backend, CancellationToken stopped)
+    public static async Task RunAsync(WebSocket socket, IBridgeBackend backend, CancellationToken stopped, ILogger? logger = null)
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(stopped);
         CancellationToken ct = cancellation.Token;
-        var outgoing = Channel.CreateBounded<Outgoing>(new BoundedChannelOptions(64) { FullMode = BoundedChannelFullMode.Wait, SingleReader = true });
+        var outgoing = Channel.CreateUnbounded<Outgoing>(new UnboundedChannelOptions { SingleReader = true });
+        long queuedBytes = 0;
         void Enqueue(Outgoing frame)
         {
-            if (!outgoing.Writer.TryWrite(frame))
-            {
-                socket.Abort();
-                cancellation.Cancel();
-            }
+            long queued = Interlocked.Add(ref queuedBytes, frame.Bytes.Length);
+            if (queued <= MaxQueuedBytes && outgoing.Writer.TryWrite(frame)) return;
+            if (queued > MaxQueuedBytes && !cancellation.IsCancellationRequested)
+                logger?.LogWarning("Ending the phone session: {Bytes} bytes are waiting for the phone, over the {Limit} byte limit.", queued, MaxQueuedBytes);
+            socket.Abort();
+            cancellation.Cancel();
         }
         void Control(object message) => Enqueue(new(JsonSerializer.SerializeToUtf8Bytes(message, BridgeCommand.Json), WebSocketMessageType.Text));
         // Queue the greeting before subscribing to native events, which can arrive synchronously during attachment.
@@ -68,6 +73,12 @@ public static class BridgeSession
         }
         catch (Exception error) when (error is OperationCanceledException or WebSocketException or ArgumentException or JsonException or InvalidOperationException)
         {
+            // Cancellation is the normal end of a session, or follows a cause that was already logged. The gateway ends
+            // every worker session by aborting its socket, so an unclosed connection is routine.
+            if (error is WebSocketException { WebSocketErrorCode: WebSocketError.ConnectionClosedPrematurely })
+                logger?.LogInformation("Phone session ended: the connection closed.");
+            else if (error is not OperationCanceledException)
+                logger?.LogWarning("Ending the phone session: {Kind}: {Reason}", error.GetType().Name, error.Message);
             socket.Abort();
         }
         finally
@@ -107,7 +118,10 @@ public static class BridgeSession
             try
             {
                 await foreach (Outgoing frame in outgoing.Reader.ReadAllAsync(ct))
+                {
                     await socket.SendAsync(frame.Bytes.AsMemory(), frame.Type, true, ct);
+                    Interlocked.Add(ref queuedBytes, -frame.Bytes.Length);
+                }
             }
             finally { cancellation.Cancel(); }
         }

@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+
 namespace STS2Mobile.Platform;
 
 /// <summary>
@@ -11,6 +13,7 @@ public static class RuntimeServices
     private static ulong _steamId;
     private static string? _displayName;
     private static IPhoneLobbies? _lobbies;
+    private static readonly ConcurrentDictionary<ulong, string> BridgeNames = new();
 
     public static void BindOwnershipVerifier(Func<Task<bool>> verifyOwnership)
     {
@@ -50,11 +53,21 @@ public static class RuntimeServices
     /// <summary>The bound lobbies, or null before the launcher binds them.</summary>
     public static IPhoneLobbies? Lobbies => Volatile.Read(ref _lobbies);
 
+    /// <summary>A Steam bridge lobby member's name, as the bridge server's Steam client reports it.</summary>
+    public static void SetBridgePlayerName(ulong playerId, string name)
+    {
+        if (playerId != 0 && !string.IsNullOrWhiteSpace(name)) BridgeNames[playerId] = name;
+    }
+
+    /// <summary>Forget the previous bridge lobby's members before joining another.</summary>
+    public static void ClearBridgePlayerNames() => BridgeNames.Clear();
+
     /// <summary>The game did not start, so the next attempt can bind again, perhaps with another account.</summary>
     public static void Unbind()
     {
         Volatile.Write(ref _verifyOwnership, null);
         Volatile.Write(ref _lobbies, null);
+        BridgeNames.Clear();
         _steamId = 0;
         _displayName = null;
     }
@@ -62,11 +75,12 @@ public static class RuntimeServices
     public static ulong GetLocalPlayerId() => _steamId != 0 ? _steamId : throw new InvalidOperationException("Steam account not bound.");
 
     /// <summary>
-    /// The account's own name for the local player, a lobby member's Steam name for another player in a lobby we are in, and
-    /// Steam's placeholder for anyone else.
+    /// The account's own name for the local player, a lobby member's Steam name for another player in a lobby we are in
+    /// (QuickMatch's or the Steam bridge's), and Steam's placeholder for anyone else.
     /// </summary>
     public static string GetPlayerName(ulong playerId) =>
-        playerId == GetLocalPlayerId() ? _displayName! : Lobbies?.MemberName(playerId) ?? UnknownPlayerName;
+        playerId == GetLocalPlayerId() ? _displayName!
+        : Lobbies?.MemberName(playerId) ?? (BridgeNames.TryGetValue(playerId, out string? name) ? name : UnknownPlayerName);
 
     /// <summary>
     /// The game waits on this before reading saves. Saves move to and from Steam Cloud only when the

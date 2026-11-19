@@ -11,6 +11,19 @@ public sealed class BridgeNotification(JsonElement message)
     public string? GetDataString(string name) =>
         message.TryGetProperty("data", out JsonElement data) && data.ValueKind == JsonValueKind.Object
         && data.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+
+    /// <summary>The lobby members of a "members" notification, skipping malformed entries.</summary>
+    public BridgeMember[] GetMembers()
+    {
+        if (!message.TryGetProperty("data", out JsonElement data) || data.ValueKind != JsonValueKind.Array) return [];
+        var members = new List<BridgeMember>();
+        foreach (JsonElement member in data.EnumerateArray())
+            if (member.ValueKind == JsonValueKind.Object
+                && member.TryGetProperty("steamId", out JsonElement id) && id.ValueKind == JsonValueKind.String
+                && member.TryGetProperty("name", out JsonElement name) && name.ValueKind == JsonValueKind.String)
+                members.Add(new(id.GetString()!, name.GetString()!));
+        return members.ToArray();
+    }
 }
 
 /// <summary>Keep generic task/timer machinery in the AOT transport assembly.</summary>

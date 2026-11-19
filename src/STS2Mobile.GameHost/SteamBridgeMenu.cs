@@ -1,6 +1,7 @@
 using System;
 using System.Globalization;
 using System.IO;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -33,6 +34,7 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
     private sealed record FriendUpdate(JsonElement Friends);
     private FriendUpdate? _pendingFriends;
     private int _serverDisconnected;
+    private bool _holdingBackground;
     private string _savedEndpoint = "";
     private const string EndpointFile = "user://steam-bridge-endpoint.txt";
 
@@ -326,7 +328,48 @@ public sealed partial class SteamBridgeMenu : CanvasLayer
 
     public override void _Notification(int what)
     {
-        if (what == NotificationApplicationPaused) Disconnect();
+        // Switching apps keeps an open server session, and a game in it, until the player returns, presses Disconnect or
+        // force-quits the app; the server notices a force-quit within half a minute.
+        if (what == NotificationApplicationPaused && (_client?.IsConnected == true || _gameBridge?.IsConnected == true)) HoldInBackground();
+        else if (what == NotificationApplicationResumed && _holdingBackground)
+        {
+            _holdingBackground = false;
+            BridgeBackground.End();
+        }
+    }
+
+    private void HoldInBackground()
+    {
+        int result = BridgeBackground.Begin();
+        _holdingBackground = result != BridgeBackground.Unavailable;
+        GD.Print("Steam bridge in the background: ", BridgeBackground.Describe(result), ".");
+        if (result == BridgeBackground.Held) MuteGameAudio();
+    }
+
+    // The game's mute in background fades over frames, and iOS stops frames in the background, so with background audio
+    // running the game would go on playing. Mute at once through the game's own setter, only when the player has mute in
+    // background on; the game's own handler restores the volume when the app returns.
+    private void MuteGameAudio()
+    {
+        try
+        {
+            var assembly = _game?.GetType().Assembly;
+            object? saves = assembly?.GetType("MegaCrit.Sts2.Core.Saves.SaveManager")?.GetProperty("Instance")?.GetValue(null);
+            object? prefs = saves?.GetType().GetProperty("PrefsSave")?.GetValue(saves);
+            object? mute = prefs?.GetType().GetProperty("MuteInBackground")?.GetValue(prefs);
+            var setter = assembly?.GetType("MegaCrit.Sts2.Core.Nodes.NMuteInBackgroundHandler")
+                ?.GetMethod("SetMasterVolume", BindingFlags.NonPublic | BindingFlags.Static, [typeof(float)]);
+            if (mute is not bool muteInBackground || setter == null)
+            {
+                GD.Print("Steam bridge in the background: the game's mute setting or volume setter was not found; its sound may keep playing.");
+                return;
+            }
+            if (muteInBackground) setter.Invoke(null, [0f]);
+        }
+        catch (Exception error) when (error is TargetInvocationException or InvalidOperationException or MemberAccessException)
+        {
+            GD.Print("Steam bridge in the background: muting failed: ", error.GetType().Name);
+        }
     }
 
     public override void _ExitTree()

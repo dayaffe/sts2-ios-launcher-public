@@ -50,12 +50,16 @@ NATIVE_UNITS = {
     "setup_overlay.mm": ("BFFFFFFFFFFFFFFFFFFFFFFF", "C00000000000000000000000", "sourcecode.cpp.objcpp"),
     "voice_audio.mm": ("C11111111111111111111111", "C22222222222222222222222", "sourcecode.cpp.objcpp"),
     "gpu_watch.mm": ("C33333333333333333333333", "C44444444444444444444444", "sourcecode.cpp.objcpp"),
+    "bridge_background.mm": ("C55555555555555555555555", "C66666666666666666666666", "sourcecode.cpp.objcpp"),
 }
 PHASE_FILES = {"Sources": NATIVE_UNITS}
 # iOS 27 stops an app built with its SDK during launch unless it uses the scene life cycle. The class
 # is defined in native/scene_lifecycle.mm and moves the engine's window onto the scene.
 SCENE_DELEGATE_CLASS = "STS2SceneDelegate"
-EXPORT_PROFILE = "godot-4.5.1-ios-full-game-export-v9"
+# iOS keeps a backgrounded app running only while it plays audio, and only with this mode. native/bridge_background.mm
+# plays silence while a Steam bridge session is open, so switching apps does not end a multiplayer game.
+BACKGROUND_MODES_KEY = "UIBackgroundModes"
+EXPORT_PROFILE = "godot-4.5.1-ios-full-game-export-v10"
 TRANSFORMATIONS = [
     "Persist the full-game startup log; verbose engine logging only on request.",
     "Use a plain launch screen and a single opaque asset-catalog icon.",
@@ -67,6 +71,7 @@ TRANSFORMATIONS = [
     "Adopt the scene life cycle iOS 27 requires; the scene delegate takes over the engine window.",
     'Compile the Files picker behind the Mods screen\'s "Add mod from Files" button.',
     "Compile QuickMatch's voice audio; the microphone text only in a build that carries QuickMatch.",
+    "Allow background audio, which keeps an open Steam bridge session running while the player is in another app.",
 ]
 
 
@@ -216,6 +221,14 @@ def fill_purpose_strings(properties: dict, with_voice: bool) -> None:
         properties[MICROPHONE_KEY] = MICROPHONE_PURPOSE
 
 
+def allow_background_audio(properties: dict) -> None:
+    """Add the audio background mode, keeping any modes the export already lists."""
+    modes = list(properties.get(BACKGROUND_MODES_KEY, []))
+    if "audio" not in modes:
+        modes.append("audio")
+    properties[BACKGROUND_MODES_KEY] = modes
+
+
 def keep_exported_symbols(text: str) -> str:
     """Strip archives to non-global symbols only.
 
@@ -297,6 +310,7 @@ def prepare() -> None:
     text = use_app_store_launch_packaging(text, properties)
     fill_purpose_strings(properties, VOICE_MOD.is_file())
     adopt_scene_lifecycle(properties)
+    allow_background_audio(properties)
     text = keep_exported_symbols(text)
     text = add_host_files(text)
     settings = local_settings()

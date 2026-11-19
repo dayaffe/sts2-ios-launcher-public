@@ -69,6 +69,24 @@ public class RuntimeServicesTests
         Assert.Null(RuntimeServices.Lobbies);
     }
 
+    [Fact]
+    public void SteamBridgeLobbyMembersGetTheNamesTheServerReports()
+    {
+        RuntimeServices.BindAccount(76561198000000001, "owner-account");
+        RuntimeServices.SetBridgePlayerName(76561198000000002, "Bridge Host");
+        RuntimeServices.SetBridgePlayerName(76561198000000003, " ");
+        Assert.Equal("owner-account", RuntimeServices.GetPlayerName(76561198000000001));
+        Assert.Equal("Bridge Host", RuntimeServices.GetPlayerName(76561198000000002));
+        Assert.Equal("[unknown]", RuntimeServices.GetPlayerName(76561198000000003));
+
+        RuntimeServices.ClearBridgePlayerNames();
+        Assert.Equal("[unknown]", RuntimeServices.GetPlayerName(76561198000000002));
+        RuntimeServices.SetBridgePlayerName(76561198000000002, "Bridge Host");
+        RuntimeServices.Unbind();
+        RuntimeServices.BindAccount(76561198000000001, "owner-account");
+        Assert.Equal("[unknown]", RuntimeServices.GetPlayerName(76561198000000002));
+    }
+
     private sealed class NamedLobbies : IPhoneLobbies
     {
         public ulong LocalId => 76561198000000001;

@@ -66,6 +66,9 @@ namespace STS2Mobile.Platform
 {
     internal static class RuntimeServices
     {
+        public static readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, string> BridgeNames = new();
         public static ulong GetLocalPlayerId() => 76561198000000001;
+        public static void SetBridgePlayerName(ulong playerId, string name) => BridgeNames[playerId] = name;
+        public static void ClearBridgePlayerNames() => BridgeNames.Clear();
     }
 }

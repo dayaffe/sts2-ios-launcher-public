@@ -12,6 +12,7 @@ from prepare_full_game_xcode import (
     SCENE_DELEGATE_CLASS,
     add_build_file,
     adopt_scene_lifecycle,
+    allow_background_audio,
     fill_purpose_strings,
     keep_exported_symbols,
     opaque_png,
@@ -82,6 +83,7 @@ class NativeUnitTests(unittest.TestCase):
         self.assertIn("setup_overlay.mm", NATIVE_UNITS)
         self.assertIn("voice_audio.mm", NATIVE_UNITS)
         self.assertIn("gpu_watch.mm", NATIVE_UNITS)
+        self.assertIn("bridge_background.mm", NATIVE_UNITS)
         for name, (_, build_id, _) in NATIVE_UNITS.items():
             self.assertIn(f"{build_id} /* {name} in Sources */,", sources)
 
@@ -196,7 +198,15 @@ class InfoPropertyTests(unittest.TestCase):
             ):
                 prepare()
 
-            self.assertIs(plistlib.loads(info.read_bytes())["LSSupportsGameMode"], True)
+            written = plistlib.loads(info.read_bytes())
+            self.assertIs(written["LSSupportsGameMode"], True)
+            self.assertEqual(written["UIBackgroundModes"], ["audio"])
+
+    def test_background_audio_keeps_other_modes_and_is_added_once(self):
+        properties = {"UIBackgroundModes": ["fetch"]}
+        allow_background_audio(properties)
+        allow_background_audio(properties)
+        self.assertEqual(properties["UIBackgroundModes"], ["fetch", "audio"])
 
     def test_unused_permissions_are_removed(self):
         properties = {
@@ -253,6 +263,17 @@ class ModImportPickerTests(unittest.TestCase):
         self.assertIn("mod_import.mm", NATIVE_UNITS)
         for name in ("sts2_mod_import_pick", "sts2_mod_import_poll"):
             self.assertIn(f'extern "C" __attribute__((visibility("default"))) int {name}(', native)
+            self.assertIn(f'NativeExports.Find("{name}")', managed)
+            self.assertIn(f"(void *)&{name}", native)
+
+
+class BridgeBackgroundTests(unittest.TestCase):
+    def test_the_managed_host_looks_up_functions_the_native_unit_exports(self):
+        root = Path(__file__).resolve().parents[1]
+        native = (root / "src/STS2Mobile.FullGame/native/bridge_background.mm").read_text()
+        managed = (root / "src/STS2Mobile.Platform/BridgeBackground.cs").read_text()
+        for name, result in (("sts2_bridge_background_begin", "int"), ("sts2_bridge_background_end", "void")):
+            self.assertIn(f'extern "C" __attribute__((visibility("default"))) {result} {name}(', native)
             self.assertIn(f'NativeExports.Find("{name}")', managed)
             self.assertIn(f"(void *)&{name}", native)
 

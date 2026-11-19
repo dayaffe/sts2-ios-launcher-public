@@ -36,10 +36,15 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
     private readonly List<CallResult<LobbyEnter_t>> _joins = [];
     private readonly SteamFriendDirectory _friends = new();
     private readonly Dictionary<ulong, DateTime> _presenceRequests = [];
+    private readonly Dictionary<ulong, DateTime> _nameRequests = [];
     private BridgeFriend[] _publishedFriends = [];
+    private BridgeMember[] _publishedMembers = [];
     private DateTime _nextFriendsUpdate;
+    private DateTime _nextMembersUpdate;
     private Callback<LobbyInvite_t>? _lobbyInvite;
     private Callback<GameLobbyJoinRequested_t>? _joinRequested;
+    private Callback<PersonaStateChange_t>? _personaChange;
+    private Callback<LobbyChatUpdate_t>? _lobbyChange;
 
     public BridgeStatus Status => _status;
 
@@ -149,6 +154,17 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
                 {
                     _publishedFriends = snapshot;
                     _notify?.Invoke(new("friends", snapshot));
+                }
+            }
+            // The phone's game names other players through these; it has no Steam client of its own.
+            if (_lobby != 0 && DateTime.UtcNow >= _nextMembersUpdate)
+            {
+                _nextMembersUpdate = DateTime.UtcNow.AddSeconds(2);
+                var members = MembersSnapshot();
+                if (!_publishedMembers.SequenceEqual(members))
+                {
+                    _publishedMembers = members;
+                    _notify?.Invoke(new("members", members));
                 }
             }
         }
@@ -276,6 +292,7 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
                 {
                     logger.LogInformation("Steam lobby join succeeded.");
                     _lobby = entered.m_ulSteamIDLobby;
+                    _nextMembersUpdate = DateTime.MinValue;
                     ulong owner = SteamMatchmaking.GetLobbyOwner(new CSteamID(_lobby)).m_SteamID;
                     answer.TrySetResult(new { lobbyId = _lobby.ToString(CultureInfo.InvariantCulture), ownerId = owner.ToString(CultureInfo.InvariantCulture) });
                 }
@@ -310,10 +327,37 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
                 SteamFriends.RequestFriendRichPresence(id);
                 _presenceRequests[id.m_SteamID] = DateTime.UtcNow;
             }
-            presence.Add(new(id.m_SteamID, SteamFriends.GetFriendPersonaName(id), playing,
-                playing ? game.m_steamIDLobby.m_SteamID : 0));
+            presence.Add(new(id.m_SteamID, Name(id), playing, playing ? game.m_steamIDLobby.m_SteamID : 0));
         }
         return _friends.Snapshot(presence, DateTime.UtcNow);
+    }
+
+    private BridgeMember[] MembersSnapshot()
+    {
+        var lobby = new CSteamID(_lobby);
+        int count = Math.Min(SteamMatchmaking.GetNumLobbyMembers(lobby), 16);
+        var members = new BridgeMember[count];
+        for (int i = 0; i < count; i++)
+        {
+            CSteamID id = SteamMatchmaking.GetLobbyMemberByIndex(lobby, i);
+            members[i] = new(id.m_SteamID.ToString(CultureInfo.InvariantCulture), Name(id));
+        }
+        return members;
+    }
+
+    private string Name(CSteamID id)
+    {
+        bool self = id == SteamUser.GetSteamID();
+        string persona = self ? SteamFriends.GetPersonaName() : SteamFriends.GetFriendPersonaName(id);
+        // A freshly started Steam client reports "[unknown]" until a persona arrives. Ask for it; PersonaStateChange_t
+        // then refreshes the friend and member lists.
+        if (SteamNames.IsUnknown(persona) && !self && (!_nameRequests.TryGetValue(id.m_SteamID, out DateTime asked)
+            || DateTime.UtcNow - asked >= TimeSpan.FromSeconds(5)))
+        {
+            SteamFriends.RequestUserInformation(id, true);
+            _nameRequests[id.m_SteamID] = DateTime.UtcNow;
+        }
+        return SteamNames.Display(persona, self ? null : SteamFriends.GetPlayerNickname(id), id.m_SteamID);
     }
 
     private object Connect(BridgeCommand command)
@@ -367,6 +411,7 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
         _peer = 0;
         if (_lobby != 0) SteamMatchmaking.LeaveLobby(new CSteamID(_lobby));
         _lobby = 0;
+        _publishedMembers = [];
         return null;
     }
 
@@ -382,6 +427,15 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
         {
             _friends.Invite(invite.m_steamIDFriend.m_SteamID, invite.m_steamIDLobby.m_SteamID, DateTime.UtcNow);
             _nextFriendsUpdate = DateTime.MinValue;
+        });
+        _personaChange = Callback<PersonaStateChange_t>.Create(_ =>
+        {
+            _nextFriendsUpdate = DateTime.MinValue;
+            _nextMembersUpdate = DateTime.MinValue;
+        });
+        _lobbyChange = Callback<LobbyChatUpdate_t>.Create(change =>
+        {
+            if (change.m_ulSteamIDLobby == _lobby) _nextMembersUpdate = DateTime.MinValue;
         });
         _socketStatus = Callback<SteamNetConnectionStatusChangedCallback_t>.Create(change =>
         {
@@ -459,6 +513,8 @@ public sealed class SteamBackend(BridgeOptions options, ILogger<SteamBackend> lo
             _joins.Clear();
             _lobbyInvite?.Dispose(); _lobbyInvite = null;
             _joinRequested?.Dispose(); _joinRequested = null;
+            _personaChange?.Dispose(); _personaChange = null;
+            _lobbyChange?.Dispose(); _lobbyChange = null;
             _socketStatus?.Dispose(); _socketStatus = null;
             _messageRequest?.Dispose(); _messageRequest = null;
             _legacyRequest?.Dispose(); _legacyRequest = null;

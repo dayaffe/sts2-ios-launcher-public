@@ -66,6 +66,7 @@ internal sealed class SteamBridgeNetClient : NetClient
     public async Task<NetErrorInfo?> ConnectAsync(CancellationToken ct)
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _stop.Token);
+        RuntimeServices.ClearBridgePlayerNames();
         try
         {
             _commandPending = true;
@@ -145,12 +146,16 @@ internal sealed class SteamBridgeNetClient : NetClient
     private void Receive(BridgePacket packet)
     {
         if (Volatile.Read(ref _closed) != 0) return;
-        if (Interlocked.Increment(ref _queuedPackets) > MaxQueuedPackets
-            || Interlocked.Add(ref _queuedBytes, packet.Payload.Length) > MaxQueuedBytes)
+        // Only the bridge's read loop adds packets, so the check and the counts below cannot interleave with another add.
+        if (Volatile.Read(ref _queuedPackets) >= MaxQueuedPackets || Interlocked.Read(ref _queuedBytes) + packet.Payload.Length > MaxQueuedBytes)
         {
-            Lost("Host packets backed up past the bridge limit while the game was not reading them.");
+            // While the app is in the background the game reads nothing for as long as the player is away. The host's
+            // heartbeats are unreliable and may be dropped; losing a reliable message would desynchronize the game.
+            if (packet.Reliable) Lost("Host packets backed up past the bridge limit while the game was not reading them.");
             return;
         }
+        Interlocked.Increment(ref _queuedPackets);
+        Interlocked.Add(ref _queuedBytes, packet.Payload.Length);
         _incoming.Enqueue(packet);
     }
 
@@ -165,6 +170,12 @@ internal sealed class SteamBridgeNetClient : NetClient
             if (state == "k_ESteamNetworkingConnectionState_Connected") _nativeConnected.Connected();
             else if (state == "k_ESteamNetworkingConnectionState_ClosedByPeer") Lost("The host closed the Steam connection" + detail + ".");
             else if (state == "k_ESteamNetworkingConnectionState_ProblemDetectedLocally") Lost("Steam lost the connection to the host" + detail + ".");
+        }
+        else if (type == "members")
+        {
+            foreach (BridgeMember member in response.GetMembers())
+                if (ulong.TryParse(member.SteamId, NumberStyles.None, CultureInfo.InvariantCulture, out ulong id))
+                    RuntimeServices.SetBridgePlayerName(id, member.Name);
         }
         else if (type == "transport_error") Lost("The server reported a transport error: " + response.GetDataString("reason"));
     }

@@ -56,4 +56,37 @@ public sealed class FriendDiscoveryTests
             TimeSpan.Zero, CancellationToken.None);
         Assert.Equal(person, Assert.Single(result));
     }
+
+    [Fact]
+    public async Task JoinableFriendWaitsBrieflyForSteamToDeliverTheirName()
+    {
+        int reads = 0;
+        var loading = new BridgeFriend("71", SteamNames.Display("[unknown]", null, 71), "109775240000000001");
+        var named = loading with { Name = "Friend" };
+        var result = await FriendDiscovery.WaitForLobbiesAsync(_ => Task.FromResult(++reads < 3 ? new[] { loading } : new[] { named }),
+            TimeSpan.FromSeconds(2), CancellationToken.None, TimeSpan.FromMilliseconds(1));
+        Assert.Equal(3, reads);
+        Assert.Equal("Friend", Assert.Single(result).Name);
+    }
+
+    [Fact]
+    public async Task JoinableFriendWithoutANameYetIsStillListedOnceTheBudgetEnds()
+    {
+        var loading = new BridgeFriend("71", SteamNames.Display("[unknown]", null, 71), "109775240000000001");
+        var result = await FriendDiscovery.WaitForLobbiesAsync(_ => Task.FromResult(new[] { loading }),
+            TimeSpan.FromMilliseconds(20), CancellationToken.None, TimeSpan.FromMilliseconds(1));
+        Assert.Equal(loading, Assert.Single(result));
+    }
+
+    [Theory]
+    [InlineData("Persona", "Nickname", "Persona")]
+    [InlineData("[unknown]", "Nickname", "Nickname")]
+    [InlineData("[unknown]", null, "Steam friend …0071")]
+    [InlineData(" ", "", "Steam friend …0071")]
+    public void NamesFallBackToTheAccountsNicknameThenAStablePlaceholder(string persona, string? nickname, string expected)
+    {
+        string name = SteamNames.Display(persona, nickname, 76561198000000071);
+        Assert.Equal(expected, name);
+        Assert.Equal(expected.StartsWith("Steam friend", StringComparison.Ordinal), SteamNames.IsPlaceholder(name));
+    }
 }

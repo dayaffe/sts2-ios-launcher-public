@@ -49,7 +49,10 @@ public static class FriendDiscovery
         {
             ct.ThrowIfCancellationRequested();
             var snapshot = await read(ct).ConfigureAwait(false);
-            if (snapshot.Any(friend => friend.LobbyId != "0") || System.Diagnostics.Stopwatch.GetElapsedTime(start) >= budget)
+            // Presence and names arrive separately after Steam starts, so a joinable entry is worth a short wait for its name.
+            var joinable = snapshot.Where(friend => friend.LobbyId != "0").ToArray();
+            if (joinable.Length != 0 && !joinable.Any(friend => SteamNames.IsPlaceholder(friend.Name))
+                || System.Diagnostics.Stopwatch.GetElapsedTime(start) >= budget)
                 return snapshot;
             await Task.Delay(pollInterval ?? TimeSpan.FromMilliseconds(250), ct).ConfigureAwait(false);
         }

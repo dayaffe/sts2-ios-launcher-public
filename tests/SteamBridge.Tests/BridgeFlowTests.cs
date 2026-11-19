@@ -9,6 +9,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using STS2Mobile.SteamBridge.Protocol;
 using STS2Mobile.GameHost;
+using STS2Mobile.Platform;
 using MegaCrit.Sts2.Core.Entities.Multiplayer;
 using MegaCrit.Sts2.Core.Multiplayer.Transport;
 using MegaCrit.Sts2.Core.Multiplayer.Game;
@@ -216,6 +217,58 @@ public sealed class BridgeFlowTests
         Assert.Equal(500, game.Packets.Count);
         Assert.Equal(499, BitConverter.ToInt32(game.Packets[^1].Bytes));
         Assert.Equal(0, game.Disconnected);
+    }
+
+    [Fact]
+    public async Task GameAdapterTakesLobbyMemberNamesFromTheServer()
+    {
+        await using var fixture = await Fixture.StartAsync();
+        fixture.Backend.ConnectImmediately = true;
+        await using var bridge = await BridgeClient.AttachAsync(await fixture.OpenAsync(), SteamId);
+        RuntimeServices.SetBridgePlayerName(HostId + 5, "Previous lobby");
+        var initializer = new SteamBridgeConnectionInitializer(bridge, 109775240000000001);
+        Assert.Null(await initializer.Connect(new GameHandler()));
+        Assert.False(RuntimeServices.BridgeNames.ContainsKey(HostId + 5));
+        fixture.Backend.Notify!(new("members", new object[]
+        {
+            new BridgeMember(HostId.ToString(), "Host Friend"),
+            new BridgeMember("not-a-steam-id", "Ignored"),
+            new { steamId = 7 },
+        }));
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        while (!RuntimeServices.BridgeNames.ContainsKey(HostId)) await Task.Delay(5, deadline.Token);
+        Assert.Equal("Host Friend", RuntimeServices.BridgeNames[HostId]);
+        Assert.Single(RuntimeServices.BridgeNames);
+    }
+
+    [Fact]
+    public async Task GameAdapterInTheBackgroundDropsOnlyUnreliablePacketsPastItsLimit()
+    {
+        await using var fixture = await Fixture.StartAsync();
+        fixture.Backend.ConnectImmediately = true;
+        await using var bridge = await BridgeClient.AttachAsync(await fixture.OpenAsync(), SteamId);
+        var game = new GameHandler();
+        var initializer = new SteamBridgeConnectionInitializer(bridge, 109775240000000001);
+        Assert.Null(await initializer.Connect(game));
+        int arrived = 0;
+        bridge.PacketReceived += _ => Interlocked.Increment(ref arrived);
+        async Task SendAsync(int count, bool reliable)
+        {
+            int target = Volatile.Read(ref arrived) + count;
+            for (int i = 0; i < count; i++) fixture.Backend.Packet!(new BridgePacket(HostId, 0, reliable, [1]));
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            while (Volatile.Read(ref arrived) < target) await Task.Delay(5, deadline.Token);
+        }
+        // The host's heartbeats keep coming while the game is not reading, for as long as the app is in the background.
+        await SendAsync(SteamBridgeNetClient.MaxQueuedPackets + 5, reliable: false);
+        game.Client!.Update();
+        Assert.True(game.Client.IsConnected);
+        Assert.Equal(SteamBridgeNetClient.MaxQueuedPackets, game.Packets.Count);
+        await SendAsync(SteamBridgeNetClient.MaxQueuedPackets, reliable: false);
+        await SendAsync(1, reliable: true);
+        game.Client.Update();
+        Assert.False(game.Client.IsConnected);
+        Assert.Contains("backed up past the bridge limit", initializer.FailureMessage);
     }
 
     [Fact]

@@ -1,0 +1,87 @@
+# Sync upstream releases into this fork. A clean merge gets a new patch release;
+# conflicts stop before the fork branch or version tag is pushed.
+name: Sync upstream and build IPA
+
+on:
+  schedule:
+    # Daily at 08:37 UTC.
+    - cron: "37 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out fork main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream and tag a new patch release
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/MikeMikerson/sts2-ios-launcher-public.git
+          git fetch --no-tags upstream +refs/heads/main:refs/remotes/upstream/main
+          git fetch --force --tags origin +refs/heads/main:refs/remotes/origin/main
+          git checkout --force -B main refs/remotes/origin/main
+
+          if git merge-base --is-ancestor refs/remotes/upstream/main main; then
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "Fork main already contains upstream main."
+            exit 0
+          fi
+
+          if ! git merge --no-edit --no-ff refs/remotes/upstream/main; then
+            git status --short
+            echo "::error title=Upstream merge failed::No clean merge from upstream/main. The fork and IPA version were left unchanged."
+            exit 1
+          fi
+
+          latest_tag="$(
+            git tag --list 'v*' |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+              sort -V |
+              tail -n 1 || true
+          )"
+          if [[ ! "$latest_tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error title=Release version not found::Expected an existing vMAJOR.MINOR.PATCH tag."
+            exit 1
+          fi
+
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          patch="$((10#${BASH_REMATCH[3]} + 1))"
+          release_tag="v${major}.${minor}.${patch}"
+          if git show-ref --verify --quiet "refs/tags/$release_tag"; then
+            echo "::error title=Release tag already exists::Refusing to overwrite $release_tag."
+            exit 1
+          fi
+
+          git tag "$release_tag"
+          git push --atomic origin main "refs/tags/$release_tag"
+
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "Merged upstream main and pushed $release_tag."
+
+      - name: Build IPA and publish SideStore source
+        if: steps.sync.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.sync.outputs.release_tag }}
+        run: gh workflow run build-ipa.yml --repo "$GITHUB_REPOSITORY" --ref "$RELEASE_TAG"
